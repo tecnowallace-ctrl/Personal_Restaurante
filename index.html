@@ -41,10 +41,17 @@
     color: var(--brasa-suave); margin-bottom: 6px;
     font-family: 'Helvetica Neue', Arial, sans-serif; font-weight: 600;
   }
-  header h1{ margin:0; font-size: 26px; font-weight: 400; letter-spacing: 0.5px; }
+  header h1{ margin:0; font-size: 22px; font-weight: 400; letter-spacing: 0.5px; }
   header .reloj{
-    margin-top: 8px; font-family: 'Helvetica Neue', Arial, sans-serif;
-    font-size: 15px; color: rgba(243,234,224,0.6); letter-spacing: 1px;
+    margin-top: 10px; font-family: 'Helvetica Neue', Arial, sans-serif;
+    font-size: 56px; font-weight: 700; letter-spacing: 1px;
+    color: var(--brasa-suave);
+    line-height: 1;
+  }
+  header .fecha{
+    margin-top: 6px; font-family: 'Helvetica Neue', Arial, sans-serif;
+    font-size: 26px; font-weight: 600; color: rgba(243,234,224,0.85);
+    text-transform: capitalize; letter-spacing: 0.3px;
   }
   main{ flex:1; overflow-y:auto; padding: 24px; display:flex; align-items:center; justify-content:center; }
   .pantalla{ width:100%; max-width: 520px; }
@@ -151,6 +158,7 @@
     <div class="marca">Montana Vinos &amp; Parrilla</div>
     <h1>Personal Montana</h1>
     <div class="reloj" id="reloj">--:--:--</div>
+    <div class="fecha" id="fecha">-- de -- --</div>
   </header>
 
   <main>
@@ -210,8 +218,8 @@ const URL_APPS_SCRIPT = "https://script.google.com/macros/s/AKfycbwWHfcgOutr6bGP
 
 const SECUENCIA_EVENTOS = ["ENTRADA", "SALIDA_ALMUERZO", "REGRESO_ALMUERZO", "SALIDA"];
 const ETIQUETAS_EVENTOS = {
-  ENTRADA: "Entrada", SALIDA_ALMUERZO: "Salida a almuerzo",
-  REGRESO_ALMUERZO: "Regreso de almuerzo", SALIDA: "Salida"
+  ENTRADA: "Entrada Montana", SALIDA_ALMUERZO: "Salida Almuerzo",
+  REGRESO_ALMUERZO: "Entrada Almuerzo", SALIDA: "Salida Montana"
 };
 
 let codigoActual = null;
@@ -223,7 +231,10 @@ let streamCamara = null;
 let fotoCapturadaB64 = null;
 
 function actualizarReloj(){
-  document.getElementById('reloj').textContent = new Date().toLocaleTimeString('es-CO', {hour12:false});
+  const ahora = new Date();
+  document.getElementById('reloj').textContent = ahora.toLocaleTimeString('es-CO', {hour12:false});
+  const fechaTexto = ahora.toLocaleDateString('es-CO', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+  document.getElementById('fecha').textContent = fechaTexto;
 }
 setInterval(actualizarReloj, 1000);
 actualizarReloj();
