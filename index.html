@@ -35,7 +35,7 @@
     text-align:center;
     border-bottom: 1px solid rgba(243,234,224,0.12);
   }
-  header .logo{ width: 56px; height:56px; margin: 0 auto 8px; display:block; border-radius: 12px; }
+  header .logo{ height: 58px; width:auto; max-width: 240px; margin: 0 auto 8px; display:block; object-fit:contain; }
   header .marca{
     font-size: 13px; letter-spacing: 3px; text-transform: uppercase;
     color: var(--brasa-suave); margin-bottom: 6px;
@@ -56,16 +56,22 @@
   main{ flex:1; overflow-y:auto; padding: 24px; display:flex; align-items:center; justify-content:center; }
   .pantalla{ width:100%; max-width: 520px; }
 
-  .grid-empleados{ display:grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .grid-empleados{ display:grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   .btn-empleado{
     background: linear-gradient(160deg, var(--vino), var(--vino-oscuro));
-    border: 1px solid rgba(243,234,224,0.15); border-radius: 14px;
-    color: var(--crema); padding: 20px 10px; font-size: 16px;
+    border: 1px solid rgba(243,234,224,0.15); border-radius: 12px;
+    color: var(--crema); padding: 12px 8px; font-size: 14px;
     font-family: 'Georgia', serif; text-align:center; cursor:pointer;
-    transition: transform .12s ease; min-height: 76px;
+    transition: transform .12s ease; min-height: 52px;
     display:flex; align-items:center; justify-content:center;
   }
   .btn-empleado:active{ transform: scale(0.96); }
+  /* Categoría 1: meseros y administrador */
+  .btn-empleado.cat1{ background: linear-gradient(160deg, #C1502E, #8A3820); }
+  /* Categoría 2: personal fino de cocina (jefe, parrillero, auxiliares fijos) */
+  .btn-empleado.cat2{ background: linear-gradient(160deg, var(--vino), var(--vino-oscuro)); }
+  /* Categoría 3: meseros de apoyo y auxiliares de apoyo */
+  .btn-empleado.cat3{ background: linear-gradient(160deg, #4A5568, #2D3748); }
   .mensaje-carga{
     text-align:center; font-family:'Helvetica Neue',Arial,sans-serif;
     color: rgba(243,234,224,0.5); font-size:14px;
@@ -154,7 +160,7 @@
 <body>
 <div id="app">
   <header>
-    <img class="logo" src="icon_pm_amarillo_192.png" alt="Personal Montana">
+    <img class="logo" src="logo_montana_header.png" alt="Montana Vinos & Parrilla">
     <div class="marca">Montana Vinos &amp; Parrilla</div>
     <h1>Personal Montana</h1>
     <div class="reloj" id="reloj">--:--:--</div>
@@ -245,6 +251,14 @@ function mostrarPantalla(id){
   });
 }
 
+// Categoría de color por código:
+// cat1 = meseros y administrador · cat2 = personal fino de cocina · cat3 = apoyo/auxiliares de refuerzo
+const CATEGORIA_POR_CODIGO = {
+  E01: "cat1", E06: "cat1", E07: "cat1", E08: "cat1",
+  E02: "cat2", E03: "cat2", E04: "cat2", E05: "cat2",
+  E09: "cat3", E10: "cat3", E11: "cat3", E12: "cat3"
+};
+
 async function cargarEmpleados(){
   try{
     const resp = await fetch(URL_APPS_SCRIPT + "?accion=empleados");
@@ -253,7 +267,7 @@ async function cargarEmpleados(){
     grid.innerHTML = "";
     datos.empleados.forEach(emp=>{
       const btn = document.createElement('div');
-      btn.className = "btn-empleado";
+      btn.className = "btn-empleado " + (CATEGORIA_POR_CODIGO[emp.codigo] || "cat2");
       btn.textContent = emp.nombre;
       btn.onclick = () => seleccionarEmpleado(emp.codigo, emp.nombre);
       grid.appendChild(btn);
