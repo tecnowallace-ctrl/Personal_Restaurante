@@ -1,0 +1,15 @@
+{
+  "name": "Personal Montana",
+  "short_name": "P.M",
+  "description": "Control de asistencia — Montana Vinos & Parrilla",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#2A2420",
+  "theme_color": "#F0B91E",
+  "icons": [
+    { "src": "icon_pm_amarillo_192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon_pm_amarillo_512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}

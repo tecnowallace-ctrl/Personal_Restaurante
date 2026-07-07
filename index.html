@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Personal Montana</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon_pm_amarillo_192.png">
+<link rel="apple-touch-icon" href="icon_pm_amarillo_180.png">
+<meta name="theme-color" content="#F0B91E">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Personal Montana">
+<style>
+  :root{
+    --vino: #5C2333;
+    --vino-oscuro: #3D1722;
+    --carbon: #2A2420;
+    --crema: #F3EAE0;
+    --brasa: #C1502E;
+    --brasa-suave: #F0B91E;
+    --verde-ok: #4C7A5C;
+  }
+  *{box-sizing:border-box; -webkit-tap-highlight-color: transparent;}
+  html,body{
+    margin:0; padding:0; height:100%;
+    background: var(--carbon);
+    font-family: 'Georgia', 'Iowan Old Style', serif;
+    color: var(--crema);
+    overflow:hidden;
+  }
+  #app{ height:100%; display:flex; flex-direction:column; }
+  header{
+    padding: 24px 24px 16px;
+    text-align:center;
+    border-bottom: 1px solid rgba(243,234,224,0.12);
+  }
+  header .logo{ width: 56px; height:56px; margin: 0 auto 8px; display:block; border-radius: 12px; }
+  header .marca{
+    font-size: 13px; letter-spacing: 3px; text-transform: uppercase;
+    color: var(--brasa-suave); margin-bottom: 6px;
+    font-family: 'Helvetica Neue', Arial, sans-serif; font-weight: 600;
+  }
+  header h1{ margin:0; font-size: 26px; font-weight: 400; letter-spacing: 0.5px; }
+  header .reloj{
+    margin-top: 8px; font-family: 'Helvetica Neue', Arial, sans-serif;
+    font-size: 15px; color: rgba(243,234,224,0.6); letter-spacing: 1px;
+  }
+  main{ flex:1; overflow-y:auto; padding: 24px; display:flex; align-items:center; justify-content:center; }
+  .pantalla{ width:100%; max-width: 520px; }
+
+  .grid-empleados{ display:grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .btn-empleado{
+    background: linear-gradient(160deg, var(--vino), var(--vino-oscuro));
+    border: 1px solid rgba(243,234,224,0.15); border-radius: 14px;
+    color: var(--crema); padding: 20px 10px; font-size: 16px;
+    font-family: 'Georgia', serif; text-align:center; cursor:pointer;
+    transition: transform .12s ease; min-height: 76px;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .btn-empleado:active{ transform: scale(0.96); }
+  .mensaje-carga{
+    text-align:center; font-family:'Helvetica Neue',Arial,sans-serif;
+    color: rgba(243,234,224,0.5); font-size:14px;
+  }
+
+  .nombre-seleccionado{ text-align:center; font-size: 22px; margin-bottom: 6px; }
+  .subtitulo{
+    text-align:center; font-family:'Helvetica Neue',Arial,sans-serif;
+    font-size: 13px; color: rgba(243,234,224,0.55); margin-bottom: 22px; letter-spacing: 0.5px;
+  }
+  .pin-visor{ display:flex; justify-content:center; gap: 14px; margin-bottom: 26px; }
+  .pin-punto{ width: 16px; height:16px; border-radius:50%; border: 1.5px solid var(--brasa-suave); background: transparent; }
+  .pin-punto.lleno{ background: var(--brasa-suave); }
+  .teclado{ display:grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .tecla{
+    background: rgba(243,234,224,0.06); border: 1px solid rgba(243,234,224,0.14);
+    border-radius: 12px; color: var(--crema); font-size: 24px;
+    font-family:'Helvetica Neue',Arial,sans-serif; padding: 18px 0; cursor:pointer;
+  }
+  .tecla:active{ background: rgba(243,234,224,0.16); }
+  .tecla.borrar{ font-size:15px; color: rgba(243,234,224,0.6); }
+  .error-pin{
+    text-align:center; color: var(--brasa); font-family:'Helvetica Neue',Arial,sans-serif;
+    font-size: 14px; height: 20px; margin-bottom: 6px;
+  }
+
+  .tarjeta-evento{
+    background: rgba(243,234,224,0.05); border: 1px solid rgba(243,234,224,0.14);
+    border-radius: 16px; padding: 26px 24px; text-align:center; margin-bottom: 18px;
+  }
+  .tarjeta-evento .etiqueta{
+    font-family:'Helvetica Neue',Arial,sans-serif; font-size: 12px; letter-spacing: 2px;
+    text-transform:uppercase; color: rgba(243,234,224,0.5); margin-bottom: 10px;
+  }
+  .tarjeta-evento .evento-nombre{ font-size: 28px; color: var(--brasa-suave); margin-bottom: 4px; }
+  .tarjeta-evento .hora-actual{ font-family:'Helvetica Neue',Arial,sans-serif; font-size: 14px; color: rgba(243,234,224,0.6); }
+  .camara-contenedor{
+    margin: 16px auto 0; width: 140px; height: 140px; border-radius: 16px;
+    overflow: hidden; border: 2px solid rgba(243,234,224,0.2); background: rgba(0,0,0,0.4);
+  }
+  .camara-contenedor video{ width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+  .camara-estado{
+    font-family:'Helvetica Neue',Arial,sans-serif; font-size: 11px; text-align:center;
+    color: rgba(243,234,224,0.45); margin-top: 8px;
+  }
+  .btn-confirmar{
+    width:100%; background: var(--verde-ok); border:none; border-radius: 14px;
+    color: white; font-size: 19px; font-family:'Helvetica Neue',Arial,sans-serif;
+    font-weight:600; padding: 20px; cursor:pointer; margin-bottom: 12px;
+  }
+  .btn-confirmar:disabled{ opacity:0.5; }
+  .cambiar-evento{
+    text-align:center; font-family:'Helvetica Neue',Arial,sans-serif; font-size: 13px;
+    color: rgba(243,234,224,0.45); margin-top: 4px; text-decoration: underline; cursor:pointer;
+  }
+  .opciones-evento{ display:grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 18px; }
+  .opcion-evento{
+    background: rgba(243,234,224,0.06); border: 1px solid rgba(243,234,224,0.14);
+    border-radius: 12px; color: var(--crema); font-family:'Helvetica Neue',Arial,sans-serif;
+    font-size: 14px; padding: 14px 6px; cursor:pointer;
+  }
+  .opcion-evento.activa{ border-color: var(--brasa-suave); background: rgba(240,185,30,0.16); }
+
+  .exito{ text-align:center; }
+  .exito .icono{
+    width: 74px; height:74px; border-radius:50%; background: var(--verde-ok);
+    display:flex; align-items:center; justify-content:center; margin: 0 auto 20px; font-size: 36px;
+  }
+  .exito h2{ font-weight:400; margin-bottom:6px; }
+  .exito p{ font-family:'Helvetica Neue',Arial,sans-serif; color: rgba(243,234,224,0.6); font-size: 14px; }
+  .estado-ubicacion{
+    font-family:'Helvetica Neue',Arial,sans-serif; font-size: 12px; text-align:center;
+    margin-top: 14px; color: rgba(243,234,224,0.4);
+  }
+  .estado-ubicacion.ok{ color: var(--verde-ok); }
+  .estado-ubicacion.falta{ color: var(--brasa); }
+
+  .oculto{ display:none !important; }
+
+  footer{
+    padding: 10px; text-align:center; font-family:'Helvetica Neue',Arial,sans-serif;
+    font-size: 11px; color: rgba(243,234,224,0.25); letter-spacing: 1px;
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <img class="logo" src="icon_pm_amarillo_192.png" alt="Personal Montana">
+    <div class="marca">Montana Vinos &amp; Parrilla</div>
+    <h1>Personal Montana</h1>
+    <div class="reloj" id="reloj">--:--:--</div>
+  </header>
+
+  <main>
+    <div class="pantalla">
+
+      <div id="pantalla-empleados">
+        <p class="mensaje-carga" id="msg-carga">Cargando personal...</p>
+        <div class="grid-empleados" id="grid-empleados"></div>
+      </div>
+
+      <div id="pantalla-pin" class="oculto">
+        <div class="nombre-seleccionado" id="nombre-pin"></div>
+        <div class="subtitulo">Ingresa tu clave de 4 dígitos</div>
+        <div class="pin-visor" id="pin-visor">
+          <div class="pin-punto"></div><div class="pin-punto"></div>
+          <div class="pin-punto"></div><div class="pin-punto"></div>
+        </div>
+        <div class="error-pin" id="error-pin"></div>
+        <div class="teclado" id="teclado"></div>
+        <div class="cambiar-evento" id="volver-empleados" style="margin-top:16px;">← Elegir otra persona</div>
+      </div>
+
+      <div id="pantalla-confirmar" class="oculto">
+        <div class="tarjeta-evento">
+          <div class="etiqueta">Vas a marcar</div>
+          <div class="evento-nombre" id="evento-sugerido">Entrada</div>
+          <div class="hora-actual" id="hora-confirmar"></div>
+          <div class="camara-contenedor"><video id="video-camara" autoplay playsinline muted></video></div>
+          <div class="camara-estado" id="camara-estado">Activando cámara...</div>
+        </div>
+        <canvas id="canvas-foto" class="oculto"></canvas>
+
+        <div id="bloque-otras-opciones" class="oculto">
+          <div class="opciones-evento" id="opciones-evento"></div>
+        </div>
+
+        <button class="btn-confirmar" id="btn-confirmar">Confirmar</button>
+        <div class="cambiar-evento" id="toggle-opciones">¿No es correcto? Elegir otro registro</div>
+      </div>
+
+      <div id="pantalla-exito" class="oculto">
+        <div class="exito">
+          <div class="icono">✓</div>
+          <h2 id="exito-titulo">Registrado</h2>
+          <p id="exito-detalle"></p>
+          <div class="estado-ubicacion" id="estado-ubicacion"></div>
+        </div>
+      </div>
+
+    </div>
+  </main>
+  <footer>Personal Montana · Registro con respaldo de ubicación y foto</footer>
+</div>
+
+<script>
+const URL_APPS_SCRIPT = "https://script.google.com/macros/s/AKfycbwWHfcgOutr6bGP-7CEzMZNrcvTnl9SQzOawMph_tgnB4BCCTnNCuzNMTQPAqvCSQI8gA/exec";
+
+const SECUENCIA_EVENTOS = ["ENTRADA", "SALIDA_ALMUERZO", "REGRESO_ALMUERZO", "SALIDA"];
+const ETIQUETAS_EVENTOS = {
+  ENTRADA: "Entrada", SALIDA_ALMUERZO: "Salida a almuerzo",
+  REGRESO_ALMUERZO: "Regreso de almuerzo", SALIDA: "Salida"
+};
+
+let codigoActual = null;
+let nombreActual = null;
+let pinActual = "";
+let eventoElegido = null;
+let coordenadas = null;
+let streamCamara = null;
+let fotoCapturadaB64 = null;
+
+function actualizarReloj(){
+  document.getElementById('reloj').textContent = new Date().toLocaleTimeString('es-CO', {hour12:false});
+}
+setInterval(actualizarReloj, 1000);
+actualizarReloj();
+
+function mostrarPantalla(id){
+  ['pantalla-empleados','pantalla-pin','pantalla-confirmar','pantalla-exito'].forEach(p=>{
+    document.getElementById(p).classList.toggle('oculto', p !== id);
+  });
+}
+
+async function cargarEmpleados(){
+  try{
+    const resp = await fetch(URL_APPS_SCRIPT + "?accion=empleados");
+    const datos = await resp.json();
+    const grid = document.getElementById('grid-empleados');
+    grid.innerHTML = "";
+    datos.empleados.forEach(emp=>{
+      const btn = document.createElement('div');
+      btn.className = "btn-empleado";
+      btn.textContent = emp.nombre;
+      btn.onclick = () => seleccionarEmpleado(emp.codigo, emp.nombre);
+      grid.appendChild(btn);
+    });
+    document.getElementById('msg-carga').classList.add('oculto');
+  }catch(e){
+    document.getElementById('msg-carga').textContent = "No se pudo conectar. Revisa la conexión e intenta de nuevo.";
+  }
+}
+cargarEmpleados();
+
+document.getElementById('volver-empleados').onclick = () => {
+  pinActual = ""; codigoActual = null; nombreActual = null;
+  actualizarVisorPin();
+  document.getElementById('error-pin').textContent = "";
+  mostrarPantalla('pantalla-empleados');
+};
+
+function seleccionarEmpleado(codigo, nombre){
+  codigoActual = codigo;
+  nombreActual = nombre;
+  pinActual = "";
+  document.getElementById('nombre-pin').textContent = nombre;
+  document.getElementById('error-pin').textContent = "";
+  actualizarVisorPin();
+  construirTeclado();
+  mostrarPantalla('pantalla-pin');
+}
+
+function construirTeclado(){
+  const teclado = document.getElementById('teclado');
+  teclado.innerHTML = "";
+  const teclas = ["1","2","3","4","5","6","7","8","9","borrar","0",""];
+  teclas.forEach(t=>{
+    const div = document.createElement('div');
+    div.className = "tecla" + (t==="borrar" ? " borrar" : "");
+    div.textContent = t==="borrar" ? "⌫" : t;
+    if(t !== ""){
+      div.onclick = () => {
+        if(t === "borrar"){ pinActual = pinActual.slice(0,-1); }
+        else if(pinActual.length < 4){ pinActual += t; }
+        actualizarVisorPin();
+        if(pinActual.length === 4){ verificarPin(); }
+      };
+    }
+    teclado.appendChild(div);
+  });
+}
+
+function actualizarVisorPin(){
+  document.querySelectorAll('#pin-visor .pin-punto').forEach((p,i)=> p.classList.toggle('lleno', i < pinActual.length));
+}
+
+async function verificarPin(){
+  document.getElementById('error-pin').textContent = "Verificando...";
+  try{
+    const resp = await fetch(URL_APPS_SCRIPT, {
+      method: "POST",
+      body: JSON.stringify({ accion: "verificarPin", codigo: codigoActual, pin: pinActual })
+    });
+    const datos = await resp.json();
+    if(!datos.valido){
+      document.getElementById('error-pin').textContent = "Clave incorrecta, intenta de nuevo.";
+      pinActual = ""; actualizarVisorPin();
+      return;
+    }
+    document.getElementById('error-pin').textContent = "";
+    prepararConfirmacion(datos.ultimoEvento);
+  }catch(e){
+    document.getElementById('error-pin').textContent = "Error de conexión. Intenta de nuevo.";
+    pinActual = ""; actualizarVisorPin();
+  }
+}
+
+function siguienteEvento(ultimo){
+  if(!ultimo) return "ENTRADA";
+  const idx = SECUENCIA_EVENTOS.indexOf(ultimo);
+  if(idx === -1 || idx === SECUENCIA_EVENTOS.length - 1) return "ENTRADA";
+  return SECUENCIA_EVENTOS[idx + 1];
+}
+
+function prepararConfirmacion(ultimoEvento){
+  eventoElegido = siguienteEvento(ultimoEvento);
+  document.getElementById('evento-sugerido').textContent = ETIQUETAS_EVENTOS[eventoElegido];
+  document.getElementById('hora-confirmar').textContent = nombreActual + " · " + new Date().toLocaleTimeString('es-CO', {hour12:false});
+  document.getElementById('bloque-otras-opciones').classList.add('oculto');
+
+  const cont = document.getElementById('opciones-evento');
+  cont.innerHTML = "";
+  SECUENCIA_EVENTOS.forEach(ev=>{
+    const div = document.createElement('div');
+    div.className = "opcion-evento" + (ev === eventoElegido ? " activa" : "");
+    div.textContent = ETIQUETAS_EVENTOS[ev];
+    div.onclick = () => {
+      eventoElegido = ev;
+      document.getElementById('evento-sugerido').textContent = ETIQUETAS_EVENTOS[ev];
+      document.querySelectorAll('.opcion-evento').forEach(o=>o.classList.remove('activa'));
+      div.classList.add('activa');
+    };
+    cont.appendChild(div);
+  });
+
+  coordenadas = null;
+  if(navigator.geolocation){
+    navigator.geolocation.getCurrentPosition(
+      (pos) => { coordenadas = { lat: pos.coords.latitude, lng: pos.coords.longitude, precision: pos.coords.accuracy }; },
+      () => { coordenadas = null; },
+      { enableHighAccuracy: true, timeout: 6000 }
+    );
+  }
+
+  iniciarCamara();
+  mostrarPantalla('pantalla-confirmar');
+}
+
+async function iniciarCamara(){
+  fotoCapturadaB64 = null;
+  const estado = document.getElementById('camara-estado');
+  const video = document.getElementById('video-camara');
+  estado.textContent = "Activando cámara...";
+  try{
+    streamCamara = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user", width: { ideal: 480 }, height: { ideal: 480 } }, audio: false
+    });
+    video.srcObject = streamCamara;
+    estado.textContent = "Foto de verificación lista";
+  }catch(e){
+    estado.textContent = "Cámara no disponible — se registrará sin foto";
+    streamCamara = null;
+  }
+}
+
+function capturarFoto(){
+  const video = document.getElementById('video-camara');
+  if(!streamCamara || !video.videoWidth){ return null; }
+  const canvas = document.getElementById('canvas-foto');
+  const lado = Math.min(video.videoWidth, video.videoHeight);
+  canvas.width = 320; canvas.height = 320;
+  const ctx = canvas.getContext('2d');
+  const offsetX = (video.videoWidth - lado) / 2;
+  const offsetY = (video.videoHeight - lado) / 2;
+  ctx.drawImage(video, offsetX, offsetY, lado, lado, 0, 0, 320, 320);
+  return canvas.toDataURL('image/jpeg', 0.6).split(',')[1];
+}
+
+function detenerCamara(){
+  if(streamCamara){ streamCamara.getTracks().forEach(t => t.stop()); streamCamara = null; }
+}
+
+document.getElementById('toggle-opciones').onclick = () => {
+  document.getElementById('bloque-otras-opciones').classList.toggle('oculto');
+};
+
+document.getElementById('btn-confirmar').onclick = async () => {
+  const boton = document.getElementById('btn-confirmar');
+  boton.disabled = true;
+  boton.textContent = "Guardando...";
+
+  fotoCapturadaB64 = capturarFoto();
+  detenerCamara();
+
+  try{
+    const resp = await fetch(URL_APPS_SCRIPT, {
+      method: "POST",
+      body: JSON.stringify({
+        accion: "registrar", codigo: codigoActual, pin: pinActual, tipoEvento: eventoElegido,
+        lat: coordenadas ? coordenadas.lat : "", lng: coordenadas ? coordenadas.lng : "",
+        precision: coordenadas ? coordenadas.precision : "", foto: fotoCapturadaB64 || ""
+      })
+    });
+    const datos = await resp.json();
+
+    document.getElementById('exito-titulo').textContent = ETIQUETAS_EVENTOS[eventoElegido] + " registrada";
+    document.getElementById('exito-detalle').textContent = nombreActual + " · " + new Date().toLocaleTimeString('es-CO', {hour12:false});
+
+    const estadoUbic = document.getElementById('estado-ubicacion');
+    if(coordenadas){
+      estadoUbic.textContent = fotoCapturadaB64 ? "Ubicación y foto registradas ✓" : "Ubicación registrada ✓ (sin foto)";
+      estadoUbic.className = "estado-ubicacion ok";
+    } else {
+      estadoUbic.textContent = "No se pudo capturar ubicación (revisar permisos del dispositivo)";
+      estadoUbic.className = "estado-ubicacion falta";
+    }
+
+    const avisoPrevio = document.getElementById('aviso-turno');
+    if(avisoPrevio) avisoPrevio.remove();
+    if(datos.alerta){
+      const avisoDiv = document.createElement('div');
+      avisoDiv.id = "aviso-turno";
+      avisoDiv.className = "estado-ubicacion falta";
+      avisoDiv.style.marginTop = "10px";
+      avisoDiv.textContent = datos.alerta;
+      estadoUbic.after(avisoDiv);
+    }
+
+    mostrarPantalla('pantalla-exito');
+
+    setTimeout(()=>{
+      pinActual = ""; codigoActual = null; nombreActual = null; eventoElegido = null; coordenadas = null; fotoCapturadaB64 = null;
+      mostrarPantalla('pantalla-empleados');
+    }, 3200);
+
+  }catch(e){
+    alert("No se pudo guardar el registro. Verifica la conexión e intenta de nuevo.");
+  } finally {
+    boton.disabled = false;
+    boton.textContent = "Confirmar";
+  }
+};
+
+if('serviceWorker' in navigator){
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('service-worker.js').catch(()=>{});
+  });
+}
+</script>
+</body>
+</html>
