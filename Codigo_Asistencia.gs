@@ -192,6 +192,7 @@ function doPost(e) {
 
   if (datos.accion === "verificarPin") return manejarVerificarPin(datos);
   if (datos.accion === "registrar") return manejarRegistrar(datos);
+  if (datos.accion === "actualizarFotoRegistro") return manejarActualizarFotoRegistro(datos);
   if (datos.accion === "renombrarEmpleado") return manejarRenombrar(datos);
   if (datos.accion === "actualizarHorario") return manejarActualizarHorario(datos);
   if (datos.accion === "ajustarHora") return manejarAjustarHora(datos);
@@ -217,6 +218,27 @@ function manejarVerificarPin(datos) {
 // ---------------------------------------------------------
 // Registrar marcación
 // ---------------------------------------------------------
+// ---------------------------------------------------------
+// Deja las columnas Fecha (B) y Hora (C) de "Registro" formateadas como
+// texto plano DE ANTEMANO, para que Sheets nunca las convierta solas a un
+// valor de fecha/hora real al escribir con appendRow. Corregir la celda
+// DESPUÉS de escribirla (como hacíamos antes) es más frágil — si ese paso
+// fallaba, la marcación quedaba guardada pero con el problema de siempre.
+// Solo se ejecuta una vez de verdad (guarda una bandera); en las demás
+// llamadas es prácticamente gratis.
+// ---------------------------------------------------------
+function asegurarColumnasTextoRegistro(hoja) {
+  const propiedades = PropertiesService.getScriptProperties();
+  if (propiedades.getProperty("formato_registro_listo") === "true") return;
+  try {
+    const filas = Math.max(hoja.getMaxRows(), 5000);
+    hoja.getRange(2, 2, filas - 1, 2).setNumberFormat("@"); // columnas B (Fecha) y C (Hora), desde la fila 2
+    propiedades.setProperty("formato_registro_listo", "true");
+  } catch (error) {
+    // Si por algo falla, no bloquea el registro — simplemente se reintentará la próxima vez.
+  }
+}
+
 function manejarRegistrar(datos) {
   const empleado = buscarEmpleadoPorCodigo(datos.codigo);
   if (!empleado || String(empleado.pin) !== String(datos.pin)) {
@@ -224,6 +246,7 @@ function manejarRegistrar(datos) {
   }
 
   const hoja = obtenerHoja(NOMBRE_HOJA_REGISTRO);
+  asegurarColumnasTextoRegistro(hoja);
   const ahora = new Date();
   const zona = ZONA_HORARIA_MONTANA;
 
@@ -237,12 +260,18 @@ function manejarRegistrar(datos) {
     alertas = { observaciones: "ERROR_AL_CALCULAR_ALERTA: " + errorAlertas.message, mensajeParaKiosko: "" };
   }
 
-  const urlFoto = guardarFoto(datos.foto, empleado.nombre, ahora);
+  // La foto se sube DESPUÉS, en una llamada aparte (ver manejarActualizarFotoRegistro
+  // más abajo) — no aquí. Subir a Drive puede tardar varios segundos, y si el
+  // registro completo depende de esperar eso, cualquier demora en Drive o en
+  // la conexión hace que el kiosko muestre error aunque el dato ya se hubiera
+  // guardado. Así, lo esencial (marcar la hora) siempre es rápido y confiable.
+  const fechaTexto = Utilities.formatDate(ahora, zona, "yyyy-MM-dd");
+  const horaTexto = Utilities.formatDate(ahora, zona, "HH:mm:ss");
 
   hoja.appendRow([
     ahora,
-    Utilities.formatDate(ahora, zona, "yyyy-MM-dd"),
-    Utilities.formatDate(ahora, zona, "HH:mm:ss"),
+    "'" + fechaTexto,  // el apóstrofe fuerza texto plano desde el momento de escribir
+    "'" + horaTexto,   // (más confiable que cambiar el formato después de guardar)
     datos.codigo,
     empleado.nombre,              // nombre "congelado" en el momento del registro
     datos.tipoEvento,
@@ -250,25 +279,52 @@ function manejarRegistrar(datos) {
     datos.lng || "",
     datos.precision || "",
     alertas.observaciones,
-    urlFoto
+    ""                             // Foto: se completa después, ver manejarActualizarFotoRegistro
   ]);
 
-  // Fuerza Fecha y Hora a texto plano — si no, Sheets las convierte solas a
-  // un valor de fecha/hora real, y al leerlas de vuelta salen desfasadas
-  // (el mismo problema que ya corregimos en Excepciones_Horario).
-  // Va en try/catch a propósito: si esto falla por cualquier motivo (permisos,
-  // protección de hoja, etc.), NUNCA debe impedir que el registro se guarde
-  // — el appendRow de arriba ya guardó la marcación correctamente.
+  // Refuerzo adicional: además del apóstrofe, forzamos también el formato de
+  // la columna a texto plano, por si acaso. Va en try/catch a propósito: si
+  // esto falla por cualquier motivo, NUNCA debe impedir que el registro se
+  // guarde — el appendRow de arriba ya guardó la marcación correctamente.
   try {
     const filaNueva = hoja.getLastRow();
     hoja.getRange(filaNueva, 2, 1, 2).setNumberFormat("@");
-    hoja.getRange(filaNueva, 2).setValue(Utilities.formatDate(ahora, zona, "yyyy-MM-dd"));
-    hoja.getRange(filaNueva, 3).setValue(Utilities.formatDate(ahora, zona, "HH:mm:ss"));
+    hoja.getRange(filaNueva, 2).setValue(fechaTexto);
+    hoja.getRange(filaNueva, 3).setValue(horaTexto);
   } catch (errorFormato) {
     // No hacemos nada — el registro ya quedó guardado por el appendRow anterior.
   }
 
-  return respuestaJson({ ok: true, alerta: alertas.mensajeParaKiosko });
+  return respuestaJson({ ok: true, alerta: alertas.mensajeParaKiosko, fila: hoja.getLastRow() });
+}
+
+// ---------------------------------------------------------
+// Sube la foto a Drive y la asocia a una fila ya guardada.
+// Se llama DESPUÉS de manejarRegistrar, como una petición aparte que el
+// kiosko no espera — así la foto nunca puede hacer fallar el registro.
+// ---------------------------------------------------------
+function manejarActualizarFotoRegistro(datos) {
+  const empleado = buscarEmpleadoPorCodigo(datos.codigo);
+  if (!empleado || String(empleado.pin) !== String(datos.pin)) {
+    return respuestaJson({ ok: false, error: "PIN inválido" });
+  }
+  if (!datos.fila) {
+    return respuestaJson({ ok: false, error: "Falta el número de fila" });
+  }
+
+  const hoja = obtenerHoja(NOMBRE_HOJA_REGISTRO);
+  const fila = Number(datos.fila);
+
+  // Verifica que esa fila sí sea del empleado correcto, por seguridad básica.
+  const codigoEnFila = hoja.getRange(fila, 4).getValue();
+  if (String(codigoEnFila) !== String(datos.codigo)) {
+    return respuestaJson({ ok: false, error: "La fila no corresponde a este empleado" });
+  }
+
+  const urlFoto = guardarFoto(datos.foto, empleado.nombre, new Date());
+  hoja.getRange(fila, 11).setValue(urlFoto); // columna K: Foto
+
+  return respuestaJson({ ok: true });
 }
 
 // ---------------------------------------------------------
@@ -327,15 +383,16 @@ function manejarGuardarExcepcion(datos) {
     hoja.appendRow(["Codigo", "Fecha", "Hora_Entrada", "Hora_Salida", "Motivo"]);
   }
 
-  hoja.appendRow([datos.codigo, datos.fecha, datos.horaEntrada, datos.horaSalida, datos.motivo || ""]);
+  hoja.appendRow([datos.codigo, "'" + datos.fecha, "'" + datos.horaEntrada, "'" + datos.horaSalida, datos.motivo || ""]);
 
-  // Fuerza las columnas de hora a texto plano — si no, Sheets las convierte
-  // solas a un valor de hora real, y luego salen fechas absurdas como
-  // "Sat Dec 30 1899 ... GMT-0456" al leerlas de vuelta.
-  const filaNueva = hoja.getLastRow();
-  hoja.getRange(filaNueva, 3, 1, 2).setNumberFormat("@");
-  hoja.getRange(filaNueva, 3).setValue(datos.horaEntrada);
-  hoja.getRange(filaNueva, 4).setValue(datos.horaSalida);
+  // Refuerzo adicional (por si acaso).
+  try {
+    const filaNueva = hoja.getLastRow();
+    hoja.getRange(filaNueva, 2, 1, 3).setNumberFormat("@");
+    hoja.getRange(filaNueva, 2).setValue(datos.fecha);
+    hoja.getRange(filaNueva, 3).setValue(datos.horaEntrada);
+    hoja.getRange(filaNueva, 4).setValue(datos.horaSalida);
+  } catch (errorFormato) { /* no pasa nada, el appendRow ya guardó la excepción */ }
 
   return respuestaJson({ ok: true });
 }
@@ -514,8 +571,8 @@ function manejarAjustarHora(datos) {
 
   hoja.appendRow([
     ahora,                              // A: Marca_Temporal real de cuándo se hizo el ajuste
-    datos.fecha,                        // B: Fecha que se está corrigiendo
-    datos.nuevaHora + ":00",            // C: Hora corregida
+    "'" + datos.fecha,                  // B: Fecha que se está corrigiendo (apóstrofe = texto forzado)
+    "'" + datos.nuevaHora + ":00",      // C: Hora corregida (apóstrofe = texto forzado)
     datos.codigo,                       // D: Codigo
     empleado.nombre,                    // E: Nombre_En_Ese_Momento
     datos.tipoEvento,                   // F: Tipo_Evento
@@ -524,11 +581,13 @@ function manejarAjustarHora(datos) {
     ""                                  // K: Foto
   ]);
 
-  // Fuerza Fecha y Hora a texto plano (mismo blindaje que en manejarRegistrar).
-  const filaNueva = hoja.getLastRow();
-  hoja.getRange(filaNueva, 2, 1, 2).setNumberFormat("@");
-  hoja.getRange(filaNueva, 2).setValue(datos.fecha);
-  hoja.getRange(filaNueva, 3).setValue(datos.nuevaHora + ":00");
+  // Refuerzo adicional (por si acaso).
+  try {
+    const filaNueva = hoja.getLastRow();
+    hoja.getRange(filaNueva, 2, 1, 2).setNumberFormat("@");
+    hoja.getRange(filaNueva, 2).setValue(datos.fecha);
+    hoja.getRange(filaNueva, 3).setValue(datos.nuevaHora + ":00");
+  } catch (errorFormato) { /* no pasa nada, el appendRow ya guardó el ajuste */ }
 
   return respuestaJson({ ok: true });
 }
@@ -658,7 +717,7 @@ function normalizarHora(valor) {
   if (valor instanceof Date) {
     return Utilities.formatDate(valor, ZONA_HORARIA_MONTANA, "HH:mm");
   }
-  return String(valor).trim().slice(0, 5);
+  return String(valor).trim().replace(/^'/, "").slice(0, 5);
 }
 
 // Igual que obtenerHoja, pero no truena si la pestaña todavía no existe
@@ -733,7 +792,7 @@ function normalizarFecha(valor) {
   if (valor instanceof Date) {
     return Utilities.formatDate(valor, ZONA_HORARIA_MONTANA, "yyyy-MM-dd");
   }
-  return String(valor).trim();
+  return String(valor).trim().replace(/^'/, "");
 }
 
 function respuestaJson(objeto) {
@@ -787,7 +846,7 @@ function calcularBitacoraDia(fecha) {
     const codigo = filas[i][3];
     const tipo = filas[i][5];
     const horaCelda = filas[i][2];
-    const hora = (horaCelda instanceof Date) ? Utilities.formatDate(horaCelda, zona, "HH:mm:ss") : String(horaCelda).trim();
+    const hora = (horaCelda instanceof Date) ? Utilities.formatDate(horaCelda, zona, "HH:mm:ss") : String(horaCelda).trim().replace(/^'/, "");
     const observaciones = String(filas[i][9] || "");
     const esAjuste = observaciones.indexOf("AJUSTE_MANUAL") !== -1;
 
@@ -1050,7 +1109,7 @@ function horaStrAMinutos(horaStr) {
     const partes = formateada.split(":");
     return parseInt(partes[0], 10) * 60 + parseInt(partes[1], 10);
   }
-  const partes = String(horaStr).split(":");
+  const partes = String(horaStr).trim().replace(/^'/, "").split(":");
   return parseInt(partes[0], 10) * 60 + parseInt(partes[1], 10);
 }
 

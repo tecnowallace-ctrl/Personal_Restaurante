@@ -430,15 +430,28 @@ document.getElementById('btn-confirmar').onclick = async () => {
   detenerCamara();
 
   try{
+    // El registro se envía SIN la foto — esto debe ser rápido y confiable siempre.
     const resp = await fetch(URL_APPS_SCRIPT, {
       method: "POST",
       body: JSON.stringify({
         accion: "registrar", codigo: codigoActual, pin: pinActual, tipoEvento: eventoElegido,
         lat: coordenadas ? coordenadas.lat : "", lng: coordenadas ? coordenadas.lng : "",
-        precision: coordenadas ? coordenadas.precision : "", foto: fotoCapturadaB64 || ""
+        precision: coordenadas ? coordenadas.precision : ""
       })
     });
     const datos = await resp.json();
+
+    // La foto se manda aparte, DESPUÉS, y no se espera su resultado — si tarda
+    // o falla, el registro ya quedó guardado de todas formas.
+    if(fotoCapturadaB64 && datos.fila){
+      fetch(URL_APPS_SCRIPT, {
+        method: "POST",
+        body: JSON.stringify({
+          accion: "actualizarFotoRegistro", codigo: codigoActual, pin: pinActual,
+          fila: datos.fila, foto: fotoCapturadaB64
+        })
+      }).catch(()=>{}); // si falla, no pasa nada — el registro principal ya está guardado
+    }
 
     document.getElementById('exito-titulo').textContent = ETIQUETAS_EVENTOS[eventoElegido] + " registrada";
     document.getElementById('exito-detalle').textContent = nombreActual + " · " + new Date().toLocaleTimeString('es-CO', {hour12:false});
