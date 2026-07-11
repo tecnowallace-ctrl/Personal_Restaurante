@@ -10,7 +10,15 @@ self.addEventListener('activate', (e) => {
 
 // Estrategia simple: intenta la red primero, y si no hay conexión
 // usa lo último que haya en caché (si existe).
+// IMPORTANTE: la caché del navegador solo admite peticiones GET — las
+// peticiones POST (registrar, verificar PIN, etc.) nunca se deben tocar
+// con cache.put(), o el navegador las rechaza con un error de red incluso
+// cuando la conexión está perfecta. Por eso las dejamos pasar directo.
 self.addEventListener('fetch', (e) => {
+  if (e.request.method !== 'GET') {
+    e.respondWith(fetch(e.request));
+    return;
+  }
   e.respondWith(
     fetch(e.request)
       .then((respuesta) => {

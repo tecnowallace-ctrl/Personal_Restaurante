@@ -471,7 +471,7 @@ document.getElementById('btn-confirmar').onclick = async () => {
     }, 3200);
 
   }catch(e){
-    alert("No se pudo guardar el registro. Verifica la conexión e intenta de nuevo.");
+    alert("La conexión tardó más de lo normal. Tu registro probablemente SÍ se guardó — no vuelvas a marcar por las dudas. Si quieres confirmarlo, pregúntale a un socio que revise el panel.");
     pinActual = ""; codigoActual = null; nombreActual = null; eventoElegido = null; coordenadas = null; fotoCapturadaB64 = null;
     mostrarPantalla('pantalla-empleados');
   } finally {
