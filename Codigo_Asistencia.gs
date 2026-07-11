@@ -20,6 +20,12 @@ const NOMBRE_HOJA_REGISTRO = "Registro";
 const NOMBRE_HOJA_HORARIO = "Horario_Semanal";
 const NOMBRE_HOJA_EXCEPCIONES = "Excepciones_Horario";
 const NOMBRE_HOJA_HISTORIAL = "Historial_Nomina";
+const NOMBRE_HOJA_NOVEDADES = "Novedades";
+
+// Zona horaria fija de Montana — NO usar Session.getScriptTimeZone() porque
+// depende de una configuración del proyecto/hoja que puede no coincidir con
+// Colombia y desfasar todas las horas registradas.
+const ZONA_HORARIA_MONTANA = "America/Bogota";
 
 const HORA_INICIO_APERTURA = 9;   // 9:00 a.m. → sale 5:00 p.m.
 const HORA_INICIO_MEDIO = 10;     // 10:00 a.m. → sale 6:00 p.m.
@@ -40,10 +46,17 @@ function horaInicioTurno(turno) {
 }
 const HORAS_PAGAS_POR_TURNO = 7;
 
+// ⚠️ Acuerdo con el equipo: aunque el almuerzo real marcado sea más corto
+// (ej. 30 min), siempre se descuenta como mínimo esta cantidad de las horas
+// trabajadas del día. Así esos minutos "cedidos" durante el almuerzo nunca
+// se cuentan como tiempo pagado ni generan hora extra. Si el almuerzo real
+// marcado es MÁS largo que esto, se respeta el real (nunca se descuenta menos).
+const MINUTOS_MINIMOS_ALMUERZO = 60;
+
 // ⚠️ La jornada máxima semanal en Colombia baja por fases (Ley 2101 de 2021).
 // Este valor representa el tope vigente HOY; para meses históricos, el
 // cálculo real por semana usa topeHorasVigente(fecha) más abajo.
-const TOPE_HORAS_SEMANALES = topeHorasVigente(Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd"));
+const TOPE_HORAS_SEMANALES = topeHorasVigente(Utilities.formatDate(new Date(), ZONA_HORARIA_MONTANA, "yyyy-MM-dd"));
 
 // Devuelve el tope legal de horas semanales vigente en una fecha dada,
 // según el cronograma de reducción de jornada de la Ley 2101 de 2021.
@@ -184,6 +197,7 @@ function doPost(e) {
   if (datos.accion === "ajustarHora") return manejarAjustarHora(datos);
   if (datos.accion === "guardarExcepcion") return manejarGuardarExcepcion(datos);
   if (datos.accion === "cerrarPeriodoNomina") return manejarCerrarPeriodoNomina(datos);
+  if (datos.accion === "guardarNovedad") return manejarGuardarNovedad(datos);
 
   return respuestaJson({ error: "Acción no reconocida" });
 }
@@ -211,8 +225,18 @@ function manejarRegistrar(datos) {
 
   const hoja = obtenerHoja(NOMBRE_HOJA_REGISTRO);
   const ahora = new Date();
-  const zona = Session.getScriptTimeZone();
-  const alertas = calcularAlertas(datos.codigo, datos.tipoEvento, ahora);
+  const zona = ZONA_HORARIA_MONTANA;
+
+  // Si el cálculo de alertas falla por cualquier motivo (turno mal configurado,
+  // hoja de excepciones con datos raros, etc.), el registro se debe guardar
+  // igual — la marcación en sí es lo prioritario, la alerta es solo informativa.
+  let alertas = { observaciones: "", mensajeParaKiosko: "" };
+  try {
+    alertas = calcularAlertas(datos.codigo, datos.tipoEvento, ahora);
+  } catch (errorAlertas) {
+    alertas = { observaciones: "ERROR_AL_CALCULAR_ALERTA: " + errorAlertas.message, mensajeParaKiosko: "" };
+  }
+
   const urlFoto = guardarFoto(datos.foto, empleado.nombre, ahora);
 
   hoja.appendRow([
@@ -228,6 +252,21 @@ function manejarRegistrar(datos) {
     alertas.observaciones,
     urlFoto
   ]);
+
+  // Fuerza Fecha y Hora a texto plano — si no, Sheets las convierte solas a
+  // un valor de fecha/hora real, y al leerlas de vuelta salen desfasadas
+  // (el mismo problema que ya corregimos en Excepciones_Horario).
+  // Va en try/catch a propósito: si esto falla por cualquier motivo (permisos,
+  // protección de hoja, etc.), NUNCA debe impedir que el registro se guarde
+  // — el appendRow de arriba ya guardó la marcación correctamente.
+  try {
+    const filaNueva = hoja.getLastRow();
+    hoja.getRange(filaNueva, 2, 1, 2).setNumberFormat("@");
+    hoja.getRange(filaNueva, 2).setValue(Utilities.formatDate(ahora, zona, "yyyy-MM-dd"));
+    hoja.getRange(filaNueva, 3).setValue(Utilities.formatDate(ahora, zona, "HH:mm:ss"));
+  } catch (errorFormato) {
+    // No hacemos nada — el registro ya quedó guardado por el appendRow anterior.
+  }
 
   return respuestaJson({ ok: true, alerta: alertas.mensajeParaKiosko });
 }
@@ -289,7 +328,67 @@ function manejarGuardarExcepcion(datos) {
   }
 
   hoja.appendRow([datos.codigo, datos.fecha, datos.horaEntrada, datos.horaSalida, datos.motivo || ""]);
+
+  // Fuerza las columnas de hora a texto plano — si no, Sheets las convierte
+  // solas a un valor de hora real, y luego salen fechas absurdas como
+  // "Sat Dec 30 1899 ... GMT-0456" al leerlas de vuelta.
+  const filaNueva = hoja.getLastRow();
+  hoja.getRange(filaNueva, 3, 1, 2).setNumberFormat("@");
+  hoja.getRange(filaNueva, 3).setValue(datos.horaEntrada);
+  hoja.getRange(filaNueva, 4).setValue(datos.horaSalida);
+
   return respuestaJson({ ok: true });
+}
+
+// ---------------------------------------------------------
+// Novedades: incapacidades, permisos u otras ausencias
+// justificadas. Un día con novedad NO se descuenta como
+// inasistencia en el cálculo de nómina.
+// ---------------------------------------------------------
+const TIPOS_NOVEDAD_VALIDOS = ["INCAPACIDAD", "PERMISO", "VACACIONES", "OTRO"];
+
+function manejarGuardarNovedad(datos) {
+  if (String(datos.pinSocios) !== PIN_PANEL_SOCIOS) {
+    return respuestaJson({ ok: false, error: "PIN de socios inválido" });
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(datos.fecha)) {
+    return respuestaJson({ ok: false, error: "Fecha inválida, debe ser AAAA-MM-DD" });
+  }
+  const tipo = String(datos.tipo || "").toUpperCase().trim();
+  if (TIPOS_NOVEDAD_VALIDOS.indexOf(tipo) === -1) {
+    return respuestaJson({ ok: false, error: "Tipo de novedad inválido" });
+  }
+  const empleado = buscarEmpleadoPorCodigo(datos.codigo);
+  if (!empleado) {
+    return respuestaJson({ ok: false, error: "Código no encontrado" });
+  }
+
+  let hoja = obtenerHojaOpcional(NOMBRE_HOJA_NOVEDADES);
+  if (!hoja) {
+    const libro = SpreadsheetApp.getActiveSpreadsheet();
+    hoja = libro.insertSheet(NOMBRE_HOJA_NOVEDADES);
+    hoja.appendRow(["Codigo", "Fecha", "Tipo", "Motivo", "Creado_En"]);
+  }
+
+  hoja.appendRow([datos.codigo, datos.fecha, tipo, datos.motivo || "", new Date()]);
+  return respuestaJson({ ok: true });
+}
+
+// Devuelve, para un rango de fechas, qué días de cada empleado
+// tienen una novedad registrada: { codigo: { fecha: tipo } }
+function obtenerNovedadesRango(fechaInicio, fechaFin) {
+  const hoja = obtenerHojaOpcional(NOMBRE_HOJA_NOVEDADES);
+  if (!hoja) return {};
+  const filas = hoja.getDataRange().getValues();
+  const resultado = {};
+  for (let i = 1; i < filas.length; i++) {
+    const codigo = filas[i][0];
+    const fecha = normalizarFecha(filas[i][1]);
+    if (!fecha || fecha < fechaInicio || fecha > fechaFin) continue;
+    if (!resultado[codigo]) resultado[codigo] = {};
+    resultado[codigo][fecha] = filas[i][2]; // Tipo
+  }
+  return resultado;
 }
 
 // ---------------------------------------------------------
@@ -361,7 +460,7 @@ function obtenerHistorialNomina() {
   if (!hoja) return { periodos: [] };
 
   const filas = hoja.getDataRange().getValues();
-  const zona = Session.getScriptTimeZone();
+  const zona = ZONA_HORARIA_MONTANA;
   const porPeriodo = {};
 
   for (let i = 1; i < filas.length; i++) {
@@ -408,7 +507,7 @@ function manejarAjustarHora(datos) {
 
   const hoja = obtenerHoja(NOMBRE_HOJA_REGISTRO);
   const ahora = new Date();
-  const zona = Session.getScriptTimeZone();
+  const zona = ZONA_HORARIA_MONTANA;
   const motivo = datos.motivo ? (" — Motivo: " + datos.motivo) : "";
   const observacion = "AJUSTE_MANUAL: corregido desde el panel el " +
     Utilities.formatDate(ahora, zona, "yyyy-MM-dd HH:mm") + motivo;
@@ -424,6 +523,12 @@ function manejarAjustarHora(datos) {
     observacion,                        // J: Observaciones
     ""                                  // K: Foto
   ]);
+
+  // Fuerza Fecha y Hora a texto plano (mismo blindaje que en manejarRegistrar).
+  const filaNueva = hoja.getLastRow();
+  hoja.getRange(filaNueva, 2, 1, 2).setNumberFormat("@");
+  hoja.getRange(filaNueva, 2).setValue(datos.fecha);
+  hoja.getRange(filaNueva, 3).setValue(datos.nuevaHora + ":00");
 
   return respuestaJson({ ok: true });
 }
@@ -466,7 +571,7 @@ function guardarFoto(fotoBase64, nombreEmpleado, ahora) {
   try {
     const base64Limpio = fotoBase64.replace(/^data:image\/\w+;base64,/, "");
     const bytes = Utilities.base64Decode(base64Limpio);
-    const zona = Session.getScriptTimeZone();
+    const zona = ZONA_HORARIA_MONTANA;
     const nombreArchivo = nombreEmpleado + "_" + Utilities.formatDate(ahora, zona, "yyyy-MM-dd_HH-mm-ss") + ".jpg";
     const blob = Utilities.newBlob(bytes, "image/jpeg", nombreArchivo);
     const carpeta = DriveApp.getFolderById(ID_CARPETA_FOTOS);
@@ -485,11 +590,11 @@ function calcularAlertas(codigo, tipoEvento, ahora) {
   let mensajeParaKiosko = "";
 
   const diaSemana = DIAS_SEMANA[ahora.getDay()];
-  const zona = Session.getScriptTimeZone();
+  const zona = ZONA_HORARIA_MONTANA;
   const fechaTexto = Utilities.formatDate(ahora, zona, "yyyy-MM-dd");
   const excepcion = obtenerExcepcionHorario(codigo, fechaTexto);
   const turnoProgramado = obtenerTurnoProgramado(codigo, diaSemana);
-  const minutosDelDia = ahora.getHours() * 60 + ahora.getMinutes();
+  const minutosDelDia = horaStrAMinutos(Utilities.formatDate(ahora, zona, "HH:mm"));
 
   if (tipoEvento === "ENTRADA") {
     if (excepcion) {
@@ -534,13 +639,26 @@ function obtenerExcepcionHorario(codigo, fechaTexto) {
     const fila = filas[i];
     if (fila[0] === codigo && normalizarFecha(fila[1]) === fechaTexto) {
       encontrada = {
-        horaEntrada: String(fila[2]).trim(),
-        horaSalida: String(fila[3]).trim(),
+        horaEntrada: normalizarHora(fila[2]),
+        horaSalida: normalizarHora(fila[3]),
         motivo: fila[4] || ""
       };
     }
   }
   return encontrada;
+}
+
+// Google Sheets a veces convierte automáticamente un texto "HH:mm" en un
+// valor de hora real (un objeto Date con fecha 30-dic-1899, el "cero" de
+// Sheets). Si luego se lee con String(), sale algo como
+// "Sat Dec 30 1899 07:21:44 GMT-0456 (hora estándar de Colombia)" —
+// esta función evita eso, devolviendo siempre un texto limpio "HH:mm".
+function normalizarHora(valor) {
+  if (!valor) return "";
+  if (valor instanceof Date) {
+    return Utilities.formatDate(valor, ZONA_HORARIA_MONTANA, "HH:mm");
+  }
+  return String(valor).trim().slice(0, 5);
 }
 
 // Igual que obtenerHoja, pero no truena si la pestaña todavía no existe
@@ -568,7 +686,7 @@ function obtenerTurnoProgramado(codigo, diaSemana) {
 function obtenerUltimoEventoDeHoy(codigo) {
   const hoja = obtenerHoja(NOMBRE_HOJA_REGISTRO);
   const filas = hoja.getDataRange().getValues();
-  const zona = Session.getScriptTimeZone();
+  const zona = ZONA_HORARIA_MONTANA;
   const hoy = Utilities.formatDate(new Date(), zona, "yyyy-MM-dd");
   let ultimo = null;
   for (let i = 1; i < filas.length; i++) {
@@ -613,7 +731,7 @@ function obtenerHoja(nombre) {
 function normalizarFecha(valor) {
   if (!valor) return "";
   if (valor instanceof Date) {
-    return Utilities.formatDate(valor, Session.getScriptTimeZone(), "yyyy-MM-dd");
+    return Utilities.formatDate(valor, ZONA_HORARIA_MONTANA, "yyyy-MM-dd");
   }
   return String(valor).trim();
 }
@@ -637,8 +755,8 @@ function obtenerExcepcionesDelMes(mesTexto) {
     if (!fecha || !fecha.startsWith(mesTexto)) continue;
     if (!resultado[fecha]) resultado[fecha] = {};
     resultado[fecha][codigo] = {
-      horaEntrada: String(filas[i][2]).trim(),
-      horaSalida: String(filas[i][3]).trim(),
+      horaEntrada: normalizarHora(filas[i][2]),
+      horaSalida: normalizarHora(filas[i][3]),
       motivo: filas[i][4] || ""
     };
   }
@@ -656,10 +774,11 @@ function calcularBitacoraDia(fecha) {
   const empleados = obtenerEmpleadosActivosConCargo();
   const horarioSemanal = obtenerHorarioSemanalCompleto();
   const diaNombre = DIAS_SEMANA_LUN_A_DOM[diaDeSemanaLunesA0(fecha)];
+  const novedadesRango = obtenerNovedadesRango(fecha, fecha);
 
   const hoja = obtenerHoja(NOMBRE_HOJA_REGISTRO);
   const filas = hoja.getDataRange().getValues();
-  const zona = Session.getScriptTimeZone();
+  const zona = ZONA_HORARIA_MONTANA;
 
   const porEmpleado = {};
   for (let i = 1; i < filas.length; i++) {
@@ -680,10 +799,12 @@ function calcularBitacoraDia(fecha) {
   const resultado = empleados.map(emp => {
     const turnoNormal = (horarioSemanal[emp.codigo] || {})[diaNombre] || "LIBRE";
     const excepcion = obtenerExcepcionHorario(emp.codigo, fecha);
+    const novedadesDelDia = novedadesRango[emp.codigo] && novedadesRango[emp.codigo][fecha];
     return {
       codigo: emp.codigo, nombre: emp.nombre, cargo: emp.cargo,
       turnoProgramado: turnoNormal,
       excepcion: excepcion,
+      novedad: novedadesDelDia || null,
       eventos: porEmpleado[emp.codigo] || []
     };
   });
@@ -712,13 +833,23 @@ function calcularResumenAdmin(mesTexto) {
 
       let horas = null;
       let incompleto = true;
+      let parcial = null;
       if (ev.ENTRADA !== undefined && ev.SALIDA !== undefined) {
         let minutosTrabajados = ev.SALIDA - ev.ENTRADA;
         if (ev.SALIDA_ALMUERZO !== undefined && ev.REGRESO_ALMUERZO !== undefined) {
-          minutosTrabajados -= (ev.REGRESO_ALMUERZO - ev.SALIDA_ALMUERZO);
+          const almuerzoReal = ev.REGRESO_ALMUERZO - ev.SALIDA_ALMUERZO;
+          minutosTrabajados -= Math.max(almuerzoReal, MINUTOS_MINIMOS_ALMUERZO);
         }
         horas = Math.round((minutosTrabajados / 60) * 100) / 100;
         incompleto = false;
+      } else if (ev.ENTRADA !== undefined) {
+        // Todavía no ha marcado salida — el frontend usa esto para mostrar
+        // cuánto lleva trabajado hasta el momento (solo tiene sentido para hoy).
+        parcial = {
+          entradaMin: ev.ENTRADA,
+          salidaAlmuerzoMin: ev.SALIDA_ALMUERZO !== undefined ? ev.SALIDA_ALMUERZO : null,
+          regresoAlmuerzoMin: ev.REGRESO_ALMUERZO !== undefined ? ev.REGRESO_ALMUERZO : null
+        };
       }
 
       const diaNombre = DIAS_SEMANA_LUN_A_DOM[diaDeSemanaLunesA0(fecha)];
@@ -728,7 +859,7 @@ function calcularResumenAdmin(mesTexto) {
       const excepcionDia = (excepciones[fecha] && excepciones[fecha][codigo]) || null;
 
       if (!diario[fecha]) diario[fecha] = {};
-      diario[fecha][codigo] = { horas: horas, incompleto: incompleto, turno: turno, ajustado: ajustado, horasExtra: horasExtraDia, excepcion: excepcionDia };
+      diario[fecha][codigo] = { horas: horas, incompleto: incompleto, turno: turno, ajustado: ajustado, horasExtra: horasExtraDia, excepcion: excepcionDia, parcial: parcial };
 
       if (horas !== null) {
         mensual[codigo] = Math.round(((mensual[codigo] || 0) + horas) * 100) / 100;
@@ -736,10 +867,12 @@ function calcularResumenAdmin(mesTexto) {
 
         if (horasExtraDia > LIMITE_EXTRA_DIARIA_HORAS) {
           const emp = empleados.find(e => e.codigo === codigo);
-          alertasLegales.push({
-            tipo: "DIARIA", codigo: codigo, nombre: emp ? emp.nombre : codigo,
-            fecha: fecha, horasExtra: horasExtraDia, limite: LIMITE_EXTRA_DIARIA_HORAS
-          });
+          if (!emp || !emp.esConfianza) {
+            alertasLegales.push({
+              tipo: "DIARIA", codigo: codigo, nombre: emp ? emp.nombre : codigo,
+              fecha: fecha, horasExtra: horasExtraDia, limite: LIMITE_EXTRA_DIARIA_HORAS
+            });
+          }
         }
 
         const semanaKey = lunesDeSemana(fecha);
@@ -757,6 +890,7 @@ function calcularResumenAdmin(mesTexto) {
       const horas = semanal[semanaKey][codigo];
       if (horas > tope) {
         const emp = empleados.find(e => e.codigo === codigo);
+        if (emp && emp.esConfianza) return; // los cargos de confianza y manejo no tienen jornada máxima (Art. 162 CST)
         const horasExtraSemana = Math.round((horas - tope) * 100) / 100;
         alertas42.push({
           codigo: codigo, nombre: emp ? emp.nombre : codigo,
@@ -816,6 +950,17 @@ function calcularResumenAdmin(mesTexto) {
 // sin borrar nunca el registro original.
 // ---------------------------------------------------------
 function construirEventosPorDia(mesTexto, fechaInicio, fechaFin) {
+  // El panel pide esto 2 veces seguidas (una para "Nómina", otra para
+  // "Recargos"), cada una en una petición HTTP separada que no puede
+  // compartir memoria — por eso usamos una caché corta (30s) para no leer
+  // toda la hoja "Registro" dos veces en la misma carga y que sea más rápido.
+  const cache = CacheService.getScriptCache();
+  const claveCache = "eventos_" + mesTexto + "_" + (fechaInicio || "") + "_" + (fechaFin || "");
+  try {
+    const cacheado = cache.get(claveCache);
+    if (cacheado) return JSON.parse(cacheado);
+  } catch (errorCache) { /* si falla la caché, seguimos y calculamos normal */ }
+
   const hoja = obtenerHoja(NOMBRE_HOJA_REGISTRO);
   const filas = hoja.getDataRange().getValues();
 
@@ -853,11 +998,29 @@ function construirEventosPorDia(mesTexto, fechaInicio, fechaFin) {
       eventos[codigo][fecha][tipo] = minutos;
     }
   }
+  try {
+    cache.put(claveCache, JSON.stringify(eventos), 30);
+  } catch (errorCache) { /* si la hoja es muy grande para cachear, no pasa nada, sigue funcionando sin caché */ }
+
   return eventos;
 }
 
 function obtenerEmpleadosActivosConCargo() {
-  return obtenerEmpleadosActivos().map(e => ({ codigo: e.codigo, nombre: e.nombre, cargo: e.cargo }));
+  const hoja = obtenerHoja(NOMBRE_HOJA_EMPLEADOS);
+  const filas = hoja.getDataRange().getValues();
+  const encabezados = filas[0];
+  const colConfianza = encabezados.indexOf("Cargo_Confianza");
+  const resultado = [];
+  for (let i = 1; i < filas.length; i++) {
+    const fila = filas[i];
+    if (fila[0] && fila[3] === true) {
+      resultado.push({
+        codigo: fila[0], nombre: fila[1], cargo: fila[4],
+        esConfianza: colConfianza > -1 && fila[colConfianza] === true
+      });
+    }
+  }
+  return resultado;
 }
 
 function obtenerHorarioSemanalCompleto() {
@@ -877,9 +1040,15 @@ function obtenerHorarioSemanalCompleto() {
 }
 
 function horaStrAMinutos(horaStr) {
-  // horaStr viene como "HH:mm:ss" (texto) o como objeto Date de Sheets
+  // horaStr viene como "HH:mm:ss" (texto) o como objeto Date de Sheets.
+  // Usamos formatDate con la zona fija en vez de getHours()/getMinutes()
+  // directos, porque esos dependen del huso horario del proyecto de Apps
+  // Script (no del nuestro), y para fechas "ancla" como 30-dic-1899 que usa
+  // Sheets para valores de solo-hora, esa diferencia puede desfasar el dato.
   if (horaStr instanceof Date) {
-    return horaStr.getHours() * 60 + horaStr.getMinutes();
+    const formateada = Utilities.formatDate(horaStr, ZONA_HORARIA_MONTANA, "HH:mm");
+    const partes = formateada.split(":");
+    return parseInt(partes[0], 10) * 60 + parseInt(partes[1], 10);
   }
   const partes = String(horaStr).split(":");
   return parseInt(partes[0], 10) * 60 + parseInt(partes[1], 10);
@@ -896,7 +1065,7 @@ function lunesDeSemana(fechaStr) {
   const dow = d.getDay();
   const diff = dow === 0 ? -6 : 1 - dow;
   d.setDate(d.getDate() + diff);
-  return Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd");
+  return Utilities.formatDate(d, ZONA_HORARIA_MONTANA, "yyyy-MM-dd");
 }
 
 // ===========================================================
@@ -907,11 +1076,102 @@ function lunesDeSemana(fechaStr) {
 // Antes de usarla para pagar nómina real, pídele a tu contador que
 // valide las tasas y la lista de festivos del año en curso.
 
+// Devuelve el rango real de fechas del período (para poder recorrer día a día).
+function obtenerRangoFechasPeriodo(mesTexto, fechaInicio, fechaFin) {
+  if (fechaInicio && fechaFin) return { inicio: fechaInicio, fin: fechaFin };
+  const anio = Number(mesTexto.slice(0, 4)), mes = Number(mesTexto.slice(5, 7));
+  const ultimoDia = new Date(anio, mes, 0).getDate();
+  return { inicio: mesTexto + "-01", fin: mesTexto + "-" + String(ultimoDia).padStart(2, "0") };
+}
+
+// ---------------------------------------------------------
+// Recorre día por día el período y compara lo que le tocaba
+// trabajar a la persona (según su horario o una excepción)
+// contra lo que realmente trabajó. Descuenta:
+//   - Días completos sin ninguna marca (ausencia injustificada)
+//   - Minutos faltantes cuando SÍ marcó pero trabajó menos de
+//     las horas de su turno (ej: llega 10 min tarde varios días
+//     seguidos, o se va antes) — esto se va acumulando.
+// Los días con una Novedad registrada (incapacidad, permiso,
+// vacaciones) NO se descuentan.
+// ---------------------------------------------------------
+function calcularHorasNoTrabajadasPeriodo(codigo, rango, horarioSemanal, eventosCodigo, novedadesCodigo) {
+  let horasFaltantes = 0;
+  let diasAusencia = 0;
+  let diasIncompletos = 0;
+  let diasConNovedad = 0;
+  let diasTrabajados = 0;
+  const semanasConAusencia = {}; // semanaKey (lunes) -> true si esa semana tuvo al menos 1 ausencia injustificada
+
+  const inicio = new Date(rango.inicio + "T00:00:00");
+  const fin = new Date(rango.fin + "T00:00:00");
+  const zona = ZONA_HORARIA_MONTANA;
+
+  for (let d = new Date(inicio); d <= fin; d.setDate(d.getDate() + 1)) {
+    const fechaStr = Utilities.formatDate(d, zona, "yyyy-MM-dd");
+    const diaNombre = DIAS_SEMANA_LUN_A_DOM[diaDeSemanaLunesA0(fechaStr)];
+
+    const excepcion = obtenerExcepcionHorario(codigo, fechaStr);
+    const turnoNormal = (horarioSemanal[codigo] || {})[diaNombre] || "LIBRE";
+    const debiaTrabajar = !!excepcion || turnoNormal === "APERTURA" || turnoNormal === "MEDIO" || turnoNormal === "CIERRE";
+    if (!debiaTrabajar) continue;
+
+    if (novedadesCodigo && novedadesCodigo[fechaStr]) {
+      diasConNovedad++;
+      continue; // incapacidad/permiso/vacaciones: no se descuenta ni afecta el descanso
+    }
+
+    const ev = eventosCodigo[fechaStr];
+    let horasTrabajadas = 0;
+    if (ev && ev.ENTRADA !== undefined && ev.SALIDA !== undefined) {
+      let minutos = ev.SALIDA - ev.ENTRADA;
+      if (ev.SALIDA_ALMUERZO !== undefined && ev.REGRESO_ALMUERZO !== undefined) {
+        const almuerzoReal = ev.REGRESO_ALMUERZO - ev.SALIDA_ALMUERZO;
+        minutos -= Math.max(almuerzoReal, MINUTOS_MINIMOS_ALMUERZO);
+      }
+      horasTrabajadas = minutos / 60;
+    }
+    if (horasTrabajadas > 0) diasTrabajados++;
+
+    const deficit = Math.max(0, HORAS_PAGAS_POR_TURNO - horasTrabajadas);
+    if (deficit > 0) {
+      horasFaltantes += deficit;
+      if (horasTrabajadas === 0) {
+        diasAusencia++;
+        semanasConAusencia[lunesDeSemana(fechaStr)] = true; // ausencia completa injustificada esa semana
+      } else {
+        diasIncompletos++;
+      }
+    }
+  }
+
+  // Art. 173 CST: quien no trabajó todos los días hábiles de la semana (sin
+  // justificación) pierde el derecho al pago del día de descanso remunerado
+  // de esa semana — se descuenta un día adicional (7h) por cada semana afectada.
+  const semanasSinDescanso = Object.keys(semanasConAusencia).length;
+  const horasDescansoPerdido = semanasSinDescanso * HORAS_PAGAS_POR_TURNO;
+  horasFaltantes += horasDescansoPerdido;
+
+  return {
+    horasFaltantes: Math.round(horasFaltantes * 100) / 100,
+    diasAusencia: diasAusencia,
+    diasIncompletos: diasIncompletos,
+    diasConNovedad: diasConNovedad,
+    diasTrabajados: diasTrabajados,
+    semanasSinDescanso: semanasSinDescanso,
+    horasDescansoPerdido: Math.round(horasDescansoPerdido * 100) / 100
+  };
+}
+
 function calcularResumenNomina(mesTexto, fechaInicio, fechaFin, divisorHorasPeriodo) {
   const empleados = obtenerEmpleadosActivosConSalario();
   const eventos = construirEventosPorDia(mesTexto, fechaInicio, fechaFin);
   const divisor = divisorHorasPeriodo || DIVISOR_HORAS_MES;
   const fraccionPeriodo = divisor / DIVISOR_HORAS_MES; // 1 = mes completo, 0.5 = quincena
+
+  const rango = obtenerRangoFechasPeriodo(mesTexto, fechaInicio, fechaFin);
+  const horarioSemanal = obtenerHorarioSemanalCompleto();
+  const novedadesRango = obtenerNovedadesRango(rango.inicio, rango.fin);
 
   const bucketsVacios = () => ({
     diurnoOrd: 0, nocturnoOrd: 0, diurnoExtra: 0, nocturnoExtra: 0,
@@ -951,6 +1211,10 @@ function calcularResumenNomina(mesTexto, fechaInicio, fechaFin, divisorHorasPeri
     const h = resultado[emp.codigo];
     Object.keys(h).forEach(k => h[k] = Math.round(h[k] * 100) / 100);
 
+    const infoFaltante = calcularHorasNoTrabajadasPeriodo(
+      emp.codigo, rango, horarioSemanal, eventos[emp.codigo] || {}, novedadesRango[emp.codigo] || {}
+    );
+
     let valorHora = null;
     let valorTotal = null;
     if (emp.salarioMensual && emp.salarioMensual > 0) {
@@ -968,16 +1232,34 @@ function calcularResumenNomina(mesTexto, fechaInicio, fechaFin, divisorHorasPeri
     }
 
     return {
-      codigo: emp.codigo, nombre: emp.nombre, cargo: emp.cargo,
+      codigo: emp.codigo, nombre: emp.nombre, cargo: emp.cargo, esConfianza: emp.esConfianza,
       horas: h, valorHora: valorHora, valorTotal: valorTotal,
       auxilioTransporte: Math.round((emp.auxilioTransporte || 0) * fraccionPeriodo),
       cedula: emp.cedula, direccion: emp.direccion, email: emp.email, telefono: emp.telefono,
-      eps: emp.eps, afp: emp.afp, arl: emp.arl, banco: emp.banco, cuenta: emp.cuenta
+      eps: emp.eps, afp: emp.afp, arl: emp.arl, banco: emp.banco, cuenta: emp.cuenta,
+      horasNoTrabajadas: infoFaltante.horasFaltantes,
+      diasAusencia: infoFaltante.diasAusencia,
+      diasIncompletos: infoFaltante.diasIncompletos,
+      diasConNovedad: infoFaltante.diasConNovedad,
+      diasTrabajados: infoFaltante.diasTrabajados,
+      semanasSinDescanso: infoFaltante.semanasSinDescanso,
+      horasDescansoPerdido: infoFaltante.horasDescansoPerdido
     };
   });
 
+  // Listado plano de novedades del período (para revisar antes de cerrar la nómina)
+  const novedadesDelPeriodo = [];
+  Object.keys(novedadesRango).forEach(codigo => {
+    const emp = empleados.find(e => e.codigo === codigo);
+    Object.keys(novedadesRango[codigo]).forEach(fecha => {
+      novedadesDelPeriodo.push({ codigo: codigo, nombre: emp ? emp.nombre : codigo, fecha: fecha, tipo: novedadesRango[codigo][fecha] });
+    });
+  });
+  novedadesDelPeriodo.sort((a, b) => a.fecha < b.fecha ? -1 : 1);
+
   return {
     detalle: detalle,
+    novedadesDelPeriodo: novedadesDelPeriodo,
     tasas: {
       recargoNocturno: RECARGO_NOCTURNO,
       extraDiurna: RECARGO_EXTRA_DIURNA,
@@ -1006,6 +1288,7 @@ function obtenerEmpleadosActivosConSalario() {
   const colARL = col("ARL");
   const colBanco = col("Banco");
   const colCuenta = col("Cuenta_Bancaria");
+  const colConfianza = col("Cargo_Confianza");
 
   const leer = (fila, colIdx) => (colIdx > -1 && fila[colIdx]) ? fila[colIdx] : "";
 
@@ -1020,6 +1303,7 @@ function obtenerEmpleadosActivosConSalario() {
         salarioMensual: salarioMensual,
         fechaIngreso: colIngreso > -1 ? fila[colIngreso] : null,
         auxilioTransporte: (salarioMensual > 0 && salarioMensual <= TOPE_SALARIOS_AUXILIO_TRANSPORTE) ? AUXILIO_TRANSPORTE_2026 : 0,
+        esConfianza: colConfianza > -1 && fila[colConfianza] === true,
         cedula: leer(fila, colCedula),
         direccion: leer(fila, colDireccion),
         email: leer(fila, colEmail),
@@ -1045,7 +1329,16 @@ function esFestivoODomingo(fechaStr) {
 // (antes y después del almuerzo, si hubo almuerzo registrado).
 function construirIntervalosTrabajo(entradaMin, salidaMin, salidaAlmMin, regresoAlmMin) {
   if (salidaAlmMin !== undefined && regresoAlmMin !== undefined) {
-    return [[entradaMin, salidaAlmMin], [regresoAlmMin, salidaMin]];
+    const almuerzoReal = regresoAlmMin - salidaAlmMin;
+    // Si el almuerzo real fue más corto que el mínimo acordado, se "estira"
+    // el regreso efectivo para que el descuento total sea siempre el mínimo.
+    const regresoEfectivo = almuerzoReal < MINUTOS_MINIMOS_ALMUERZO
+      ? salidaAlmMin + MINUTOS_MINIMOS_ALMUERZO
+      : regresoAlmMin;
+    if (regresoEfectivo >= salidaMin) {
+      return [[entradaMin, salidaAlmMin]]; // el almuerzo mínimo ya cubre el resto del día
+    }
+    return [[entradaMin, salidaAlmMin], [regresoEfectivo, salidaMin]];
   }
   return [[entradaMin, salidaMin]];
 }
@@ -1095,7 +1388,7 @@ function desglosarMinutosDelDia(intervalos) {
 // incluir en el Reporte DIAN del mes (ese reporta solo lo pagado).
 function calcularProvisiones(mesTexto) {
   const empleados = obtenerEmpleadosActivosConSalario();
-  const zona = Session.getScriptTimeZone();
+  const zona = ZONA_HORARIA_MONTANA;
   const primerDiaMes = new Date(mesTexto + "-01T00:00:00");
   const ultimoDiaMes = new Date(primerDiaMes.getFullYear(), primerDiaMes.getMonth() + 1, 0);
   const diasDelMes = ultimoDiaMes.getDate();

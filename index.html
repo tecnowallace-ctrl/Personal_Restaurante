@@ -405,12 +405,12 @@ function capturarFoto(){
   if(!streamCamara || !video.videoWidth){ return null; }
   const canvas = document.getElementById('canvas-foto');
   const lado = Math.min(video.videoWidth, video.videoHeight);
-  canvas.width = 320; canvas.height = 320;
+  canvas.width = 200; canvas.height = 200;
   const ctx = canvas.getContext('2d');
   const offsetX = (video.videoWidth - lado) / 2;
   const offsetY = (video.videoHeight - lado) / 2;
   ctx.drawImage(video, offsetX, offsetY, lado, lado, 0, 0, 320, 320);
-  return canvas.toDataURL('image/jpeg', 0.6).split(',')[1];
+  return canvas.toDataURL('image/jpeg', 0.4).split(',')[1];
 }
 
 function detenerCamara(){
@@ -472,6 +472,8 @@ document.getElementById('btn-confirmar').onclick = async () => {
 
   }catch(e){
     alert("No se pudo guardar el registro. Verifica la conexión e intenta de nuevo.");
+    pinActual = ""; codigoActual = null; nombreActual = null; eventoElegido = null; coordenadas = null; fotoCapturadaB64 = null;
+    mostrarPantalla('pantalla-empleados');
   } finally {
     boton.disabled = false;
     boton.textContent = "Confirmar";
