@@ -218,27 +218,6 @@ function manejarVerificarPin(datos) {
 // ---------------------------------------------------------
 // Registrar marcación
 // ---------------------------------------------------------
-// ---------------------------------------------------------
-// Deja las columnas Fecha (B) y Hora (C) de "Registro" formateadas como
-// texto plano DE ANTEMANO, para que Sheets nunca las convierta solas a un
-// valor de fecha/hora real al escribir con appendRow. Corregir la celda
-// DESPUÉS de escribirla (como hacíamos antes) es más frágil — si ese paso
-// fallaba, la marcación quedaba guardada pero con el problema de siempre.
-// Solo se ejecuta una vez de verdad (guarda una bandera); en las demás
-// llamadas es prácticamente gratis.
-// ---------------------------------------------------------
-function asegurarColumnasTextoRegistro(hoja) {
-  const propiedades = PropertiesService.getScriptProperties();
-  if (propiedades.getProperty("formato_registro_listo") === "true") return;
-  try {
-    const filas = Math.max(hoja.getMaxRows(), 5000);
-    hoja.getRange(2, 2, filas - 1, 2).setNumberFormat("@"); // columnas B (Fecha) y C (Hora), desde la fila 2
-    propiedades.setProperty("formato_registro_listo", "true");
-  } catch (error) {
-    // Si por algo falla, no bloquea el registro — simplemente se reintentará la próxima vez.
-  }
-}
-
 function manejarRegistrar(datos) {
   const empleado = buscarEmpleadoPorCodigo(datos.codigo);
   if (!empleado || String(empleado.pin) !== String(datos.pin)) {
@@ -246,7 +225,6 @@ function manejarRegistrar(datos) {
   }
 
   const hoja = obtenerHoja(NOMBRE_HOJA_REGISTRO);
-  asegurarColumnasTextoRegistro(hoja);
   const ahora = new Date();
   const zona = ZONA_HORARIA_MONTANA;
 
@@ -271,7 +249,7 @@ function manejarRegistrar(datos) {
   hoja.appendRow([
     ahora,
     "'" + fechaTexto,  // el apóstrofe fuerza texto plano desde el momento de escribir
-    "'" + horaTexto,   // (más confiable que cambiar el formato después de guardar)
+    "'" + horaTexto,
     datos.codigo,
     empleado.nombre,              // nombre "congelado" en el momento del registro
     datos.tipoEvento,
@@ -281,19 +259,6 @@ function manejarRegistrar(datos) {
     alertas.observaciones,
     ""                             // Foto: se completa después, ver manejarActualizarFotoRegistro
   ]);
-
-  // Refuerzo adicional: además del apóstrofe, forzamos también el formato de
-  // la columna a texto plano, por si acaso. Va en try/catch a propósito: si
-  // esto falla por cualquier motivo, NUNCA debe impedir que el registro se
-  // guarde — el appendRow de arriba ya guardó la marcación correctamente.
-  try {
-    const filaNueva = hoja.getLastRow();
-    hoja.getRange(filaNueva, 2, 1, 2).setNumberFormat("@");
-    hoja.getRange(filaNueva, 2).setValue(fechaTexto);
-    hoja.getRange(filaNueva, 3).setValue(horaTexto);
-  } catch (errorFormato) {
-    // No hacemos nada — el registro ya quedó guardado por el appendRow anterior.
-  }
 
   return respuestaJson({ ok: true, alerta: alertas.mensajeParaKiosko, fila: hoja.getLastRow() });
 }
@@ -384,15 +349,6 @@ function manejarGuardarExcepcion(datos) {
   }
 
   hoja.appendRow([datos.codigo, "'" + datos.fecha, "'" + datos.horaEntrada, "'" + datos.horaSalida, datos.motivo || ""]);
-
-  // Refuerzo adicional (por si acaso).
-  try {
-    const filaNueva = hoja.getLastRow();
-    hoja.getRange(filaNueva, 2, 1, 3).setNumberFormat("@");
-    hoja.getRange(filaNueva, 2).setValue(datos.fecha);
-    hoja.getRange(filaNueva, 3).setValue(datos.horaEntrada);
-    hoja.getRange(filaNueva, 4).setValue(datos.horaSalida);
-  } catch (errorFormato) { /* no pasa nada, el appendRow ya guardó la excepción */ }
 
   return respuestaJson({ ok: true });
 }
@@ -580,14 +536,6 @@ function manejarAjustarHora(datos) {
     observacion,                        // J: Observaciones
     ""                                  // K: Foto
   ]);
-
-  // Refuerzo adicional (por si acaso).
-  try {
-    const filaNueva = hoja.getLastRow();
-    hoja.getRange(filaNueva, 2, 1, 2).setNumberFormat("@");
-    hoja.getRange(filaNueva, 2).setValue(datos.fecha);
-    hoja.getRange(filaNueva, 3).setValue(datos.nuevaHora + ":00");
-  } catch (errorFormato) { /* no pasa nada, el appendRow ya guardó el ajuste */ }
 
   return respuestaJson({ ok: true });
 }
