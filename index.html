@@ -90,8 +90,10 @@
     background: rgba(243,234,224,0.06); border: 1px solid rgba(243,234,224,0.14);
     border-radius: 12px; color: var(--crema); font-size: 24px;
     font-family:'Helvetica Neue',Arial,sans-serif; padding: 18px 0; cursor:pointer;
+    transition: background 0.08s ease, transform 0.08s ease;
   }
   .tecla:active{ background: rgba(243,234,224,0.16); }
+  .tecla.tecla-presionada{ background: var(--brasa-suave); color: #241C15; transform: scale(0.94); }
   .tecla.borrar{ font-size:15px; color: rgba(243,234,224,0.6); }
   .error-pin{
     text-align:center; color: var(--brasa); font-family:'Helvetica Neue',Arial,sans-serif;
@@ -307,6 +309,8 @@ function construirTeclado(){
     div.textContent = t==="borrar" ? "⌫" : t;
     if(t !== ""){
       div.onclick = () => {
+        div.classList.add("tecla-presionada");
+        setTimeout(() => div.classList.remove("tecla-presionada"), 150);
         if(t === "borrar"){ pinActual = pinActual.slice(0,-1); }
         else if(pinActual.length < 4){ pinActual += t; }
         actualizarVisorPin();
