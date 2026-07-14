@@ -147,7 +147,8 @@ function doGet(e) {
     }
     const mes = e.parameter.mes;
     const quincena = e.parameter.quincena; // "1" o "2"
-    const ultimoDia = new Date(Number(mes.slice(0,4)), Number(mes.slice(5,7)), 0).getDate();
+    const ultimoDiaReal = new Date(Number(mes.slice(0,4)), Number(mes.slice(5,7)), 0).getDate();
+    const ultimoDia = Math.min(ultimoDiaReal, 30); // mes comercial de 30 días
     const fechaInicio = quincena === "1" ? (mes + "-01") : (mes + "-16");
     const fechaFin = quincena === "1" ? (mes + "-15") : (mes + "-" + String(ultimoDia).padStart(2,"0"));
     return respuestaJson(calcularResumenNomina(mes, fechaInicio, fechaFin, DIVISOR_HORAS_QUINCENA));
@@ -166,6 +167,26 @@ function doGet(e) {
     }
     const fecha = e.parameter.fecha; // "YYYY-MM-DD"
     return respuestaJson(calcularBitacoraDia(fecha));
+  }
+
+  if (accion === "calcularCesantias") {
+    if (String(e.parameter.pin) !== PIN_PANEL_SOCIOS) return respuestaJson({ error: "PIN inválido" });
+    return respuestaJson(calcularCesantias(e.parameter.codigo, Number(e.parameter.anio)));
+  }
+
+  if (accion === "calcularPrima") {
+    if (String(e.parameter.pin) !== PIN_PANEL_SOCIOS) return respuestaJson({ error: "PIN inválido" });
+    return respuestaJson(calcularPrima(e.parameter.codigo, Number(e.parameter.anio), Number(e.parameter.semestre)));
+  }
+
+  if (accion === "calcularVacaciones") {
+    if (String(e.parameter.pin) !== PIN_PANEL_SOCIOS) return respuestaJson({ error: "PIN inválido" });
+    return respuestaJson(calcularVacaciones(e.parameter.codigo, e.parameter.fechaInicio, e.parameter.fechaFin));
+  }
+
+  if (accion === "calcularLiquidacionFinal") {
+    if (String(e.parameter.pin) !== PIN_PANEL_SOCIOS) return respuestaJson({ error: "PIN inválido" });
+    return respuestaJson(calcularLiquidacionFinal(e.parameter.codigo, e.parameter.fechaRetiro));
   }
 
   if (accion === "resumenProvisiones") {
@@ -199,6 +220,7 @@ function doPost(e) {
   if (datos.accion === "guardarExcepcion") return manejarGuardarExcepcion(datos);
   if (datos.accion === "cerrarPeriodoNomina") return manejarCerrarPeriodoNomina(datos);
   if (datos.accion === "guardarNovedad") return manejarGuardarNovedad(datos);
+  if (datos.accion === "actualizarEstadoNovedad") return manejarActualizarEstadoNovedad(datos);
 
   return respuestaJson({ error: "Acción no reconocida" });
 }
@@ -360,6 +382,11 @@ function manejarGuardarExcepcion(datos) {
 // ---------------------------------------------------------
 const TIPOS_NOVEDAD_VALIDOS = ["INCAPACIDAD", "PERMISO", "VACACIONES", "OTRO"];
 
+// Estados de revisión de una novedad — hasta que un socio la revise, queda
+// en PENDIENTE y NO se descuenta (beneficio de la duda). Solo pasa a
+// descontarse si explícitamente se marca SIN_SOPORTE_DESCONTAR.
+const ESTADOS_NOVEDAD_VALIDOS = ["PENDIENTE", "VALIDADA_SOPORTE", "SIN_SOPORTE_DESCONTAR", "SOLICITAR_EPS"];
+
 function manejarGuardarNovedad(datos) {
   if (String(datos.pinSocios) !== PIN_PANEL_SOCIOS) {
     return respuestaJson({ ok: false, error: "PIN de socios inválido" });
@@ -380,11 +407,46 @@ function manejarGuardarNovedad(datos) {
   if (!hoja) {
     const libro = SpreadsheetApp.getActiveSpreadsheet();
     hoja = libro.insertSheet(NOMBRE_HOJA_NOVEDADES);
-    hoja.appendRow(["Codigo", "Fecha", "Tipo", "Motivo", "Creado_En"]);
+    hoja.appendRow(["Codigo", "Fecha", "Tipo", "Motivo", "Creado_En", "Estado"]);
   }
 
-  hoja.appendRow([datos.codigo, datos.fecha, tipo, datos.motivo || "", new Date()]);
+  hoja.appendRow([datos.codigo, datos.fecha, tipo, datos.motivo || "", new Date(), "PENDIENTE"]);
   return respuestaJson({ ok: true });
+}
+
+// ---------------------------------------------------------
+// Cambia el estado de revisión de una novedad ya registrada.
+// - VALIDADA_SOPORTE: hay permiso/soporte válido → no se descuenta.
+// - SIN_SOPORTE_DESCONTAR: no hay soporte → sí se descuenta el día.
+// - SOLICITAR_EPS: incapacidad con soporte de EPS → no se descuenta al
+//   empleado, pero queda marcada para reclamar el pago a la EPS.
+// ---------------------------------------------------------
+function manejarActualizarEstadoNovedad(datos) {
+  if (String(datos.pinSocios) !== PIN_PANEL_SOCIOS) {
+    return respuestaJson({ ok: false, error: "PIN de socios inválido" });
+  }
+  const estado = String(datos.estado || "").toUpperCase().trim();
+  if (ESTADOS_NOVEDAD_VALIDOS.indexOf(estado) === -1) {
+    return respuestaJson({ ok: false, error: "Estado no válido" });
+  }
+  const hoja = obtenerHojaOpcional(NOMBRE_HOJA_NOVEDADES);
+  if (!hoja) return respuestaJson({ ok: false, error: "No hay novedades registradas todavía" });
+
+  const filas = hoja.getDataRange().getValues();
+  const encabezados = filas[0];
+  let colEstado = encabezados.indexOf("Estado");
+  if (colEstado === -1) {
+    colEstado = encabezados.length;
+    hoja.getRange(1, colEstado + 1).setValue("Estado");
+  }
+
+  for (let i = 1; i < filas.length; i++) {
+    if (filas[i][0] === datos.codigo && normalizarFecha(filas[i][1]) === datos.fecha) {
+      hoja.getRange(i + 1, colEstado + 1).setValue(estado);
+      return respuestaJson({ ok: true });
+    }
+  }
+  return respuestaJson({ ok: false, error: "No se encontró esa novedad" });
 }
 
 // Devuelve, para un rango de fechas, qué días de cada empleado
@@ -393,13 +455,19 @@ function obtenerNovedadesRango(fechaInicio, fechaFin) {
   const hoja = obtenerHojaOpcional(NOMBRE_HOJA_NOVEDADES);
   if (!hoja) return {};
   const filas = hoja.getDataRange().getValues();
+  const encabezados = filas[0];
+  const colEstado = encabezados.indexOf("Estado");
   const resultado = {};
   for (let i = 1; i < filas.length; i++) {
     const codigo = filas[i][0];
     const fecha = normalizarFecha(filas[i][1]);
     if (!fecha || fecha < fechaInicio || fecha > fechaFin) continue;
     if (!resultado[codigo]) resultado[codigo] = {};
-    resultado[codigo][fecha] = filas[i][2]; // Tipo
+    resultado[codigo][fecha] = {
+      tipo: filas[i][2],
+      motivo: filas[i][3] || "",
+      estado: (colEstado > -1 && filas[i][colEstado]) ? filas[i][colEstado] : "PENDIENTE"
+    };
   }
   return resultado;
 }
@@ -747,6 +815,170 @@ function respuestaJson(objeto) {
   return ContentService.createTextOutput(JSON.stringify(objeto)).setMimeType(ContentService.MimeType.JSON);
 }
 
+// ---------------------------------------------------------
+// Módulo de Liquidación — Prima, Vacaciones, Liquidación final.
+// Colombia liquida sobre el "año comercial" de 360 días (12 meses de 30
+// días cada uno) — por eso los días entre dos fechas NO se cuentan como
+// calendario real, sino con esta convención fija.
+// ---------------------------------------------------------
+function diasComercialesEntre(fechaInicioStr, fechaFinStr) {
+  const [aI, mI, dIReal] = fechaInicioStr.split("-").map(Number);
+  const [aF, mF, dFReal] = fechaFinStr.split("-").map(Number);
+  const dI = Math.min(dIReal, 30);
+  const dF = Math.min(dFReal, 30);
+  return (aF - aI) * 360 + (mF - mI) * 30 + (dF - dI) + 1; // +1 incluye ambos extremos
+}
+
+function obtenerFechaIngresoTexto(emp) {
+  if (!emp.fechaIngreso) return "";
+  return normalizarFecha(emp.fechaIngreso);
+}
+
+// Prima de servicios: (salario × días trabajados en el semestre) / 360.
+// semestre 1 = ene-jun (se paga antes del 30 de junio), 2 = jul-dic (antes del 20 de diciembre).
+function calcularPrima(codigo, anio, semestre) {
+  const emp = obtenerEmpleadosActivosConSalario().find(e => e.codigo === codigo);
+  if (!emp) return { error: "Código no encontrado" };
+  if (!emp.salarioMensual) return { error: "Esta persona no tiene salario cargado en Empleados" };
+
+  const inicioSemestre = semestre === 1 ? (anio + "-01-01") : (anio + "-07-01");
+  const finSemestre = semestre === 1 ? (anio + "-06-30") : (anio + "-12-31");
+
+  let inicioReal = inicioSemestre;
+  const fechaIngreso = obtenerFechaIngresoTexto(emp);
+  if (fechaIngreso && fechaIngreso > inicioSemestre) inicioReal = fechaIngreso;
+
+  if (fechaIngreso && fechaIngreso > finSemestre) {
+    return { error: "Esta persona ingresó después de terminar ese semestre — no hay prima que liquidar todavía." };
+  }
+
+  const diasTrabajados = Math.max(0, Math.min(diasComercialesEntre(inicioReal, finSemestre), 180));
+  const valorPrima = Math.round((emp.salarioMensual * diasTrabajados) / 360);
+  const salud = Math.round(valorPrima * 0.04);
+  const pension = Math.round(valorPrima * 0.04);
+
+  return {
+    codigo: emp.codigo, nombre: emp.nombre, cargo: emp.cargo, salarioMensual: emp.salarioMensual,
+    periodoInicio: inicioReal, periodoFin: finSemestre, diasTrabajados: diasTrabajados,
+    valorPrima: valorPrima, salud: salud, pension: pension, totalDeducciones: salud + pension,
+    netoAPagar: valorPrima - salud - pension
+  };
+}
+
+// Vacaciones: 15 días hábiles por cada 360 días trabajados.
+// Valor a pagar = (salario × días trabajados en el período) / 720.
+function calcularVacaciones(codigo, fechaInicio, fechaFin) {
+  const emp = obtenerEmpleadosActivosConSalario().find(e => e.codigo === codigo);
+  if (!emp) return { error: "Código no encontrado" };
+  if (!emp.salarioMensual) return { error: "Esta persona no tiene salario cargado en Empleados" };
+  if (fechaFin < fechaInicio) return { error: "La fecha final debe ser posterior a la inicial" };
+
+  const diasTrabajados = diasComercialesEntre(fechaInicio, fechaFin);
+  const diasVacacionesAcumulados = Math.round((diasTrabajados * 15 / 360) * 100) / 100;
+  const valorVacaciones = Math.round((emp.salarioMensual * diasTrabajados) / 720);
+  // Nota: las vacaciones NO llevan descuento de salud/pensión aparte —
+  // ya se cotizó sobre ellas en el salario del período en que se disfrutan
+  // (el empleado sigue devengando su salario normal esos días).
+
+  return {
+    codigo: emp.codigo, nombre: emp.nombre, cargo: emp.cargo, salarioMensual: emp.salarioMensual,
+    periodoInicio: fechaInicio, periodoFin: fechaFin, diasTrabajados: diasTrabajados,
+    diasVacacionesAcumulados: diasVacacionesAcumulados, valorVacaciones: valorVacaciones
+  };
+}
+
+// Cesantías (Art. 249 CST): se consignan anualmente antes del 14 de
+// febrero, por el año calendario que acaba de terminar (o proporcional si
+// la persona ingresó durante ese año, o si el año todavía no ha terminado).
+// Fórmula: (salario × días trabajados en el año) / 360.
+function calcularCesantias(codigo, anio) {
+  const emp = obtenerEmpleadosActivosConSalario().find(e => e.codigo === codigo);
+  if (!emp) return { error: "Código no encontrado" };
+  if (!emp.salarioMensual) return { error: "Esta persona no tiene salario cargado en Empleados" };
+  const fechaIngreso = obtenerFechaIngresoTexto(emp);
+  if (!fechaIngreso) return { error: "Falta la Fecha_Ingreso de esta persona en la pestaña Empleados" };
+
+  let inicioAnio = anio + "-01-01";
+  if (fechaIngreso > inicioAnio) inicioAnio = fechaIngreso;
+  const finAnioReal = anio + "-12-31";
+  const hoy = Utilities.formatDate(new Date(), ZONA_HORARIA_MONTANA, "yyyy-MM-dd");
+  const finAnio = finAnioReal < hoy ? finAnioReal : hoy; // no cuenta días futuros si el año no ha terminado
+
+  if (inicioAnio > finAnio) {
+    return { codigo: emp.codigo, nombre: emp.nombre, anio: anio, dias: 0, valorCesantias: 0, interesesCesantias: 0, periodoInicio: inicioAnio, periodoFin: finAnio };
+  }
+
+  const dias = diasComercialesEntre(inicioAnio, finAnio);
+  const valorCesantias = Math.round((emp.salarioMensual * dias) / 360);
+  const interesesCesantias = Math.round(valorCesantias * (dias / 360) * 0.12);
+
+  return {
+    codigo: emp.codigo, nombre: emp.nombre, cargo: emp.cargo, salarioMensual: emp.salarioMensual,
+    anio: anio, periodoInicio: inicioAnio, periodoFin: finAnio, dias: dias,
+    valorCesantias: valorCesantias, interesesCesantias: interesesCesantias,
+    fechaLimitePago: (anio + 1) + "-02-14"
+  };
+}
+
+// Liquidación final: prestaciones sociales proporcionales al momento del
+// retiro. NO incluye indemnización por despido injustificado — eso depende
+// de la causa del retiro y del tipo de contrato, y debe validarse con un
+// abogado o contador antes de pagar.
+function calcularLiquidacionFinal(codigo, fechaRetiro) {
+  const emp = obtenerEmpleadosActivosConSalario().find(e => e.codigo === codigo);
+  if (!emp) return { error: "Código no encontrado" };
+  if (!emp.salarioMensual) return { error: "Esta persona no tiene salario cargado en Empleados" };
+  const fechaIngreso = obtenerFechaIngresoTexto(emp);
+  if (!fechaIngreso) return { error: "Falta la Fecha_Ingreso de esta persona en la pestaña Empleados" };
+  if (fechaRetiro < fechaIngreso) return { error: "La fecha de retiro no puede ser anterior a la fecha de ingreso" };
+
+  const diasTotalesTrabajados = diasComercialesEntre(fechaIngreso, fechaRetiro);
+
+  // Cesantías: proporcional desde el 1 de enero del año de retiro (o desde el ingreso, si fue ese mismo año)
+  const anioRetiro = Number(fechaRetiro.slice(0, 4));
+  let inicioCesantias = anioRetiro + "-01-01";
+  if (fechaIngreso > inicioCesantias) inicioCesantias = fechaIngreso;
+  const diasCesantias = diasComercialesEntre(inicioCesantias, fechaRetiro);
+  const cesantias = Math.round((emp.salarioMensual * diasCesantias) / 360);
+  const interesesCesantias = Math.round(cesantias * (diasCesantias / 360) * 0.12);
+
+  // Prima proporcional del semestre en curso al momento del retiro
+  const mesRetiro = Number(fechaRetiro.slice(5, 7));
+  const semestreActual = mesRetiro <= 6 ? 1 : 2;
+  let inicioPrima = semestreActual === 1 ? (anioRetiro + "-01-01") : (anioRetiro + "-07-01");
+  if (fechaIngreso > inicioPrima) inicioPrima = fechaIngreso;
+  const diasPrima = diasComercialesEntre(inicioPrima, fechaRetiro);
+  const primaProporcional = Math.round((emp.salarioMensual * diasPrima) / 360);
+
+  // Vacaciones proporcionales de toda la relación laboral (ajusta si ya se pagaron antes)
+  const diasVacacionesAcumulados = Math.round((diasTotalesTrabajados * 15 / 360) * 100) / 100;
+  const vacaciones = Math.round((emp.salarioMensual * diasTotalesTrabajados) / 720);
+
+  // Deducciones: salud y pensión (4% + 4%) sobre el total devengado de la liquidación,
+  // igual que en cualquier pago de nómina — muchos contadores NO descuentan sobre
+  // cesantías ni sus intereses (están exentos), así que la base de deducción es
+  // solo prima proporcional + vacaciones proporcionales.
+  const baseDeduccion = primaProporcional + vacaciones;
+  const salud = Math.round(baseDeduccion * 0.04);
+  const pension = Math.round(baseDeduccion * 0.04);
+  const totalDeducciones = salud + pension;
+
+  const totalDevengado = cesantias + interesesCesantias + primaProporcional + vacaciones;
+  const totalLiquidacion = totalDevengado - totalDeducciones;
+
+  return {
+    codigo: emp.codigo, nombre: emp.nombre, cargo: emp.cargo, salarioMensual: emp.salarioMensual,
+    fechaIngreso: fechaIngreso, fechaRetiro: fechaRetiro, diasTotalesTrabajados: diasTotalesTrabajados,
+    cesantias: cesantias, cesantiasDesde: inicioCesantias, diasCesantias: diasCesantias,
+    interesesCesantias: interesesCesantias,
+    primaProporcional: primaProporcional, primaDesde: inicioPrima, diasPrimaProporcional: diasPrima,
+    vacaciones: vacaciones, diasVacacionesAcumulados: diasVacacionesAcumulados,
+    salud: salud, pension: pension, totalDeducciones: totalDeducciones,
+    totalDevengado: totalDevengado, totalLiquidacion: totalLiquidacion,
+    aviso: "No incluye indemnización por despido injustificado — valida la causa del retiro con tu abogado o contador antes de pagar."
+  };
+}
+
 // ===========================================================
 // PANEL DE SOCIOS — resumen diario / semanal / mensual
 // ===========================================================
@@ -841,13 +1073,19 @@ function calcularResumenAdmin(mesTexto) {
       let horas = null;
       let incompleto = true;
       let parcial = null;
+      let almuerzoNoMarcado = false;
       if (ev.ENTRADA !== undefined && ev.SALIDA !== undefined) {
         let minutosTrabajados = ev.SALIDA - ev.ENTRADA;
         if (ev.SALIDA_ALMUERZO !== undefined && ev.REGRESO_ALMUERZO !== undefined) {
           const almuerzoReal = ev.REGRESO_ALMUERZO - ev.SALIDA_ALMUERZO;
           minutosTrabajados -= Math.max(almuerzoReal, MINUTOS_MINIMOS_ALMUERZO);
+        } else {
+          // Fue directo de Entrada a Salida sin marcar el almuerzo — se
+          // descuenta igual el mínimo acordado, para no pagarle de más.
+          minutosTrabajados -= MINUTOS_MINIMOS_ALMUERZO;
+          almuerzoNoMarcado = true;
         }
-        horas = Math.round((minutosTrabajados / 60) * 100) / 100;
+        horas = Math.round((Math.max(0, minutosTrabajados) / 60) * 100) / 100;
         incompleto = false;
       } else if (ev.ENTRADA !== undefined) {
         // Todavía no ha marcado salida — el frontend usa esto para mostrar
@@ -866,7 +1104,7 @@ function calcularResumenAdmin(mesTexto) {
       const excepcionDia = (excepciones[fecha] && excepciones[fecha][codigo]) || null;
 
       if (!diario[fecha]) diario[fecha] = {};
-      diario[fecha][codigo] = { horas: horas, incompleto: incompleto, turno: turno, ajustado: ajustado, horasExtra: horasExtraDia, excepcion: excepcionDia, parcial: parcial };
+      diario[fecha][codigo] = { horas: horas, incompleto: incompleto, turno: turno, ajustado: ajustado, horasExtra: horasExtraDia, excepcion: excepcionDia, parcial: parcial, almuerzoNoMarcado: almuerzoNoMarcado };
 
       if (horas !== null) {
         mensual[codigo] = Math.round(((mensual[codigo] || 0) + horas) * 100) / 100;
@@ -1017,13 +1255,15 @@ function obtenerEmpleadosActivosConCargo() {
   const filas = hoja.getDataRange().getValues();
   const encabezados = filas[0];
   const colConfianza = encabezados.indexOf("Cargo_Confianza");
+  const colTipoPersonal = encabezados.indexOf("Tipo_Personal");
   const resultado = [];
   for (let i = 1; i < filas.length; i++) {
     const fila = filas[i];
     if (fila[0] && fila[3] === true) {
       resultado.push({
         codigo: fila[0], nombre: fila[1], cargo: fila[4],
-        esConfianza: colConfianza > -1 && fila[colConfianza] === true
+        esConfianza: colConfianza > -1 && fila[colConfianza] === true,
+        tipoPersonal: (colTipoPersonal > -1 && String(fila[colTipoPersonal]).toUpperCase().trim() === "TURNO") ? "TURNO" : "PLANTA"
       });
     }
   }
@@ -1083,11 +1323,17 @@ function lunesDeSemana(fechaStr) {
 // Antes de usarla para pagar nómina real, pídele a tu contador que
 // valide las tasas y la lista de festivos del año en curso.
 
+
 // Devuelve el rango real de fechas del período (para poder recorrer día a día).
 function obtenerRangoFechasPeriodo(mesTexto, fechaInicio, fechaFin) {
   if (fechaInicio && fechaFin) return { inicio: fechaInicio, fin: fechaFin };
   const anio = Number(mesTexto.slice(0, 4)), mes = Number(mesTexto.slice(5, 7));
-  const ultimoDia = new Date(anio, mes, 0).getDate();
+  const ultimoDiaReal = new Date(anio, mes, 0).getDate();
+  // Colombia liquida el mes comercial de 30 días — el sueldo fijo mensual no
+  // cambia entre un mes de 28, 30 o 31 días, así que el día 31 (si existe)
+  // no debe generar ni horas ordinarias ni extra aparte: ya está cubierto
+  // por el sueldo fijo. Por eso el rango nunca pasa del día 30.
+  const ultimoDia = Math.min(ultimoDiaReal, 30);
   return { inicio: mesTexto + "-01", fin: mesTexto + "-" + String(ultimoDia).padStart(2, "0") };
 }
 
@@ -1123,10 +1369,15 @@ function calcularHorasNoTrabajadasPeriodo(codigo, rango, horarioSemanal, eventos
     const debiaTrabajar = !!excepcion || turnoNormal === "APERTURA" || turnoNormal === "MEDIO" || turnoNormal === "CIERRE";
     if (!debiaTrabajar) continue;
 
-    if (novedadesCodigo && novedadesCodigo[fechaStr]) {
+    const novedadDelDia = novedadesCodigo && novedadesCodigo[fechaStr];
+    if (novedadDelDia && novedadDelDia.estado !== "SIN_SOPORTE_DESCONTAR") {
+      // PENDIENTE, VALIDADA_SOPORTE o SOLICITAR_EPS: no se descuenta (beneficio
+      // de la duda hasta que un socio la marque explícitamente sin soporte).
       diasConNovedad++;
-      continue; // incapacidad/permiso/vacaciones: no se descuenta ni afecta el descanso
+      continue;
     }
+    // Si la novedad quedó marcada SIN_SOPORTE_DESCONTAR, sigue de largo y
+    // el día se evalúa igual que una ausencia normal (si aplica, se descuenta).
 
     const ev = eventosCodigo[fechaStr];
     let horasTrabajadas = 0;
@@ -1135,8 +1386,10 @@ function calcularHorasNoTrabajadasPeriodo(codigo, rango, horarioSemanal, eventos
       if (ev.SALIDA_ALMUERZO !== undefined && ev.REGRESO_ALMUERZO !== undefined) {
         const almuerzoReal = ev.REGRESO_ALMUERZO - ev.SALIDA_ALMUERZO;
         minutos -= Math.max(almuerzoReal, MINUTOS_MINIMOS_ALMUERZO);
+      } else {
+        minutos -= MINUTOS_MINIMOS_ALMUERZO;
       }
-      horasTrabajadas = minutos / 60;
+      horasTrabajadas = Math.max(0, minutos) / 60;
     }
     if (horasTrabajadas > 0) diasTrabajados++;
 
@@ -1172,11 +1425,11 @@ function calcularHorasNoTrabajadasPeriodo(codigo, rango, horarioSemanal, eventos
 
 function calcularResumenNomina(mesTexto, fechaInicio, fechaFin, divisorHorasPeriodo) {
   const empleados = obtenerEmpleadosActivosConSalario();
-  const eventos = construirEventosPorDia(mesTexto, fechaInicio, fechaFin);
+  const rango = obtenerRangoFechasPeriodo(mesTexto, fechaInicio, fechaFin); // ya limita el mes completo a 30 días
+  const eventos = construirEventosPorDia(mesTexto, rango.inicio, rango.fin);
   const divisor = divisorHorasPeriodo || DIVISOR_HORAS_MES;
   const fraccionPeriodo = divisor / DIVISOR_HORAS_MES; // 1 = mes completo, 0.5 = quincena
 
-  const rango = obtenerRangoFechasPeriodo(mesTexto, fechaInicio, fechaFin);
   const horarioSemanal = obtenerHorarioSemanalCompleto();
   const novedadesRango = obtenerNovedadesRango(rango.inicio, rango.fin);
 
@@ -1186,10 +1439,15 @@ function calcularResumenNomina(mesTexto, fechaInicio, fechaFin, divisorHorasPeri
   });
 
   const resultado = {};
-  empleados.forEach(emp => { resultado[emp.codigo] = bucketsVacios(); });
+  const diasTrabajadosPorCodigo = {}; // { diasOrdinarios, diasDomFest } — para pagar a los turneros por día
+  empleados.forEach(emp => {
+    resultado[emp.codigo] = bucketsVacios();
+    diasTrabajadosPorCodigo[emp.codigo] = { diasOrdinarios: 0, diasDomFest: 0 };
+  });
 
   Object.keys(eventos).forEach(codigo => {
     if (!resultado[codigo]) resultado[codigo] = bucketsVacios();
+    if (!diasTrabajadosPorCodigo[codigo]) diasTrabajadosPorCodigo[codigo] = { diasOrdinarios: 0, diasDomFest: 0 };
     Object.keys(eventos[codigo]).forEach(fecha => {
       const ev = eventos[codigo][fecha];
       if (ev.ENTRADA === undefined || ev.SALIDA === undefined) return; // registro incompleto, se omite
@@ -1204,11 +1462,13 @@ function calcularResumenNomina(mesTexto, fechaInicio, fechaFin, divisorHorasPeri
         acc.festNocturnoOrd += desglose.nocturnoOrd;
         acc.festDiurnoExtra += desglose.diurnoExtra;
         acc.festNocturnoExtra += desglose.nocturnoExtra;
+        diasTrabajadosPorCodigo[codigo].diasDomFest++;
       } else {
         acc.diurnoOrd += desglose.diurnoOrd;
         acc.nocturnoOrd += desglose.nocturnoOrd;
         acc.diurnoExtra += desglose.diurnoExtra;
         acc.nocturnoExtra += desglose.nocturnoExtra;
+        diasTrabajadosPorCodigo[codigo].diasOrdinarios++;
       }
     });
   });
@@ -1238,10 +1498,29 @@ function calcularResumenNomina(mesTexto, fechaInicio, fechaFin, divisorHorasPeri
       );
     }
 
+    // Turneros de Cocina/Salón: NO tienen sueldo fijo mensual — se les paga
+    // únicamente por los días que trabajaron, y ese día se paga distinto según
+    // sea ordinario o dominical/festivo (Art. 179 CST, recargo dominical/festivo).
+    const diasInfo = diasTrabajadosPorCodigo[emp.codigo] || { diasOrdinarios: 0, diasDomFest: 0 };
+    let valorDiaOrdinario = null, valorDiaDomFest = null, valorPorDias = null, auxTransporteFinal;
+    if (emp.tipoPersonal === "TURNO" && emp.salarioMensual > 0) {
+      valorDiaOrdinario = Math.round(emp.salarioMensual / 30);
+      valorDiaDomFest = Math.round(valorDiaOrdinario * (1 + RECARGO_DOMINICAL_FESTIVO));
+      valorPorDias = (diasInfo.diasOrdinarios * valorDiaOrdinario) + (diasInfo.diasDomFest * valorDiaDomFest);
+      // El auxilio de transporte de un turnero es proporcional a los días
+      // realmente trabajados, no a una fracción fija del mes/quincena.
+      auxTransporteFinal = Math.round(((emp.auxilioTransporte || 0) / 30) * (diasInfo.diasOrdinarios + diasInfo.diasDomFest));
+    } else {
+      auxTransporteFinal = Math.round((emp.auxilioTransporte || 0) * fraccionPeriodo);
+    }
+
     return {
       codigo: emp.codigo, nombre: emp.nombre, cargo: emp.cargo, esConfianza: emp.esConfianza,
+      tipoPersonal: emp.tipoPersonal,
       horas: h, valorHora: valorHora, valorTotal: valorTotal,
-      auxilioTransporte: Math.round((emp.auxilioTransporte || 0) * fraccionPeriodo),
+      auxilioTransporte: auxTransporteFinal,
+      diasOrdinariosTrabajados: diasInfo.diasOrdinarios, diasDomFestTrabajados: diasInfo.diasDomFest,
+      valorDiaOrdinario: valorDiaOrdinario, valorDiaDomFest: valorDiaDomFest, valorPorDiasTrabajados: valorPorDias,
       cedula: emp.cedula, direccion: emp.direccion, email: emp.email, telefono: emp.telefono,
       eps: emp.eps, afp: emp.afp, arl: emp.arl, banco: emp.banco, cuenta: emp.cuenta,
       horasNoTrabajadas: infoFaltante.horasFaltantes,
@@ -1259,7 +1538,11 @@ function calcularResumenNomina(mesTexto, fechaInicio, fechaFin, divisorHorasPeri
   Object.keys(novedadesRango).forEach(codigo => {
     const emp = empleados.find(e => e.codigo === codigo);
     Object.keys(novedadesRango[codigo]).forEach(fecha => {
-      novedadesDelPeriodo.push({ codigo: codigo, nombre: emp ? emp.nombre : codigo, fecha: fecha, tipo: novedadesRango[codigo][fecha] });
+      const n = novedadesRango[codigo][fecha];
+      novedadesDelPeriodo.push({
+        codigo: codigo, nombre: emp ? emp.nombre : codigo, fecha: fecha,
+        tipo: n.tipo, motivo: n.motivo, estado: n.estado
+      });
     });
   });
   novedadesDelPeriodo.sort((a, b) => a.fecha < b.fecha ? -1 : 1);
@@ -1296,6 +1579,7 @@ function obtenerEmpleadosActivosConSalario() {
   const colBanco = col("Banco");
   const colCuenta = col("Cuenta_Bancaria");
   const colConfianza = col("Cargo_Confianza");
+  const colTipoPersonal = col("Tipo_Personal");
 
   const leer = (fila, colIdx) => (colIdx > -1 && fila[colIdx]) ? fila[colIdx] : "";
 
@@ -1305,9 +1589,10 @@ function obtenerEmpleadosActivosConSalario() {
     const [codigo, nombre, pin, activo, cargo] = fila;
     if (codigo && activo === true) {
       const salarioMensual = colSalario > -1 ? Number(fila[colSalario]) || 0 : 0;
+      const tipoPersonal = colTipoPersonal > -1 && String(fila[colTipoPersonal]).toUpperCase().trim() === "TURNO" ? "TURNO" : "PLANTA";
       resultado.push({
         codigo: codigo, nombre: nombre, cargo: cargo,
-        salarioMensual: salarioMensual,
+        salarioMensual: salarioMensual, tipoPersonal: tipoPersonal,
         fechaIngreso: colIngreso > -1 ? fila[colIngreso] : null,
         auxilioTransporte: (salarioMensual > 0 && salarioMensual <= TOPE_SALARIOS_AUXILIO_TRANSPORTE) ? AUXILIO_TRANSPORTE_2026 : 0,
         esConfianza: colConfianza > -1 && fila[colConfianza] === true,
@@ -1347,7 +1632,11 @@ function construirIntervalosTrabajo(entradaMin, salidaMin, salidaAlmMin, regreso
     }
     return [[entradaMin, salidaAlmMin], [regresoEfectivo, salidaMin]];
   }
-  return [[entradaMin, salidaMin]];
+  // Nunca marcó ni salida ni entrada de almuerzo (ej. fue directo de Entrada
+  // a Salida) — igual se descuenta el mínimo de almuerzo acordado, porque
+  // es imposible que haya trabajado corrido sin parar a comer ese tiempo.
+  const salidaConDescuento = Math.max(entradaMin, salidaMin - MINUTOS_MINIMOS_ALMUERZO);
+  return [[entradaMin, salidaConDescuento]];
 }
 
 // Reparte los minutos trabajados del día en 4 categorías:
