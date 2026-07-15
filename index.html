@@ -152,6 +152,10 @@
   .estado-ubicacion.falta{ color: var(--brasa); }
 
   .oculto{ display:none !important; }
+  #indicador-pendientes{
+    background: rgba(240,185,30,0.15); border: 1px solid var(--brasa-suave); color: var(--brasa-suave);
+    border-radius: 10px; padding: 10px 14px; margin: 0 16px 12px; font-size: 13px; text-align: center;
+  }
 
   footer{
     padding: 10px; text-align:center; font-family:'Helvetica Neue',Arial,sans-serif;
@@ -173,6 +177,7 @@
     <div class="pantalla">
 
       <div id="pantalla-empleados">
+        <div id="indicador-pendientes" class="oculto"></div>
         <p class="mensaje-carga" id="msg-carga">Cargando personal...</p>
         <div class="grid-empleados" id="grid-empleados"></div>
       </div>
@@ -261,22 +266,38 @@ const CATEGORIA_POR_CODIGO = {
   E09: "cat3", E10: "cat3", E11: "cat3", E12: "cat3"
 };
 
+const CLAVE_EMPLEADOS_CACHE = "montana_empleados_cache";
+
+function pintarGridEmpleados(listaEmpleados){
+  const grid = document.getElementById('grid-empleados');
+  grid.innerHTML = "";
+  listaEmpleados.forEach(emp=>{
+    const btn = document.createElement('div');
+    btn.className = "btn-empleado " + (CATEGORIA_POR_CODIGO[emp.codigo] || "cat2");
+    btn.textContent = emp.nombre;
+    btn.onclick = () => seleccionarEmpleado(emp.codigo, emp.nombre);
+    grid.appendChild(btn);
+  });
+  document.getElementById('msg-carga').classList.add('oculto');
+}
+
 async function cargarEmpleados(){
   try{
     const resp = await fetch(URL_APPS_SCRIPT + "?accion=empleados");
     const datos = await resp.json();
-    const grid = document.getElementById('grid-empleados');
-    grid.innerHTML = "";
-    datos.empleados.forEach(emp=>{
-      const btn = document.createElement('div');
-      btn.className = "btn-empleado " + (CATEGORIA_POR_CODIGO[emp.codigo] || "cat2");
-      btn.textContent = emp.nombre;
-      btn.onclick = () => seleccionarEmpleado(emp.codigo, emp.nombre);
-      grid.appendChild(btn);
-    });
-    document.getElementById('msg-carga').classList.add('oculto');
+    pintarGridEmpleados(datos.empleados);
+    localStorage.setItem(CLAVE_EMPLEADOS_CACHE, JSON.stringify(datos.empleados));
   }catch(e){
-    document.getElementById('msg-carga').textContent = "No se pudo conectar. Revisa la conexión e intenta de nuevo.";
+    // Sin conexión para cargar la lista en vivo — usa la última copia
+    // guardada en este celular (de la última vez que sí hubo señal), para
+    // que se pueda seguir marcando aunque no haya internet ahora mismo.
+    const cache = localStorage.getItem(CLAVE_EMPLEADOS_CACHE);
+    if(cache){
+      pintarGridEmpleados(JSON.parse(cache));
+      document.getElementById('msg-carga').textContent = "";
+    } else {
+      document.getElementById('msg-carga').textContent = "No se pudo conectar y no hay ninguna lista guardada en este celular todavía. Conéctate al menos una vez para poder usar el kiosko sin conexión después.";
+    }
   }
 }
 cargarEmpleados();
@@ -325,6 +346,17 @@ function actualizarVisorPin(){
   document.querySelectorAll('#pin-visor .pin-punto').forEach((p,i)=> p.classList.toggle('lleno', i < pinActual.length));
 }
 
+const CLAVE_PINS_VERIFICADOS = "montana_pins_verificados";
+
+function leerPinsVerificados(){
+  try{ return JSON.parse(localStorage.getItem(CLAVE_PINS_VERIFICADOS) || "{}"); }catch(e){ return {}; }
+}
+function recordarPinVerificado(codigo, pin){
+  const guardados = leerPinsVerificados();
+  guardados[codigo] = pin;
+  localStorage.setItem(CLAVE_PINS_VERIFICADOS, JSON.stringify(guardados));
+}
+
 async function verificarPin(){
   document.getElementById('error-pin').textContent = "Verificando...";
   try{
@@ -338,11 +370,22 @@ async function verificarPin(){
       pinActual = ""; actualizarVisorPin();
       return;
     }
+    recordarPinVerificado(codigoActual, pinActual); // para poder validar sin conexión la próxima vez
     document.getElementById('error-pin').textContent = "";
     prepararConfirmacion(datos.ultimoEvento);
   }catch(e){
-    document.getElementById('error-pin').textContent = "Error de conexión. Intenta de nuevo.";
-    pinActual = ""; actualizarVisorPin();
+    // Sin conexión para verificar en vivo — revisa si esta clave ya se
+    // verificó antes en este mismo celular (la última vez que sí hubo señal).
+    const guardados = leerPinsVerificados();
+    if(guardados[codigoActual] !== undefined && String(guardados[codigoActual]) === String(pinActual)){
+      document.getElementById('error-pin').textContent = "";
+      // Sin conexión no sabemos cuál fue tu última marca — el sistema
+      // sugiere "Entrada" por defecto, pero puedes elegir otra abajo si no es la correcta.
+      prepararConfirmacion(null);
+    } else {
+      document.getElementById('error-pin').textContent = "Sin conexión, y esta clave no se había usado antes en este celular. Conéctate al menos una vez para poder marcar sin internet después.";
+      pinActual = ""; actualizarVisorPin();
+    }
   }
 }
 
@@ -433,16 +476,30 @@ document.getElementById('btn-confirmar').onclick = async () => {
   fotoCapturadaB64 = capturarFoto();
   detenerCamara();
 
+  // La hora se captura AQUÍ, en el celular, en el momento exacto en que la
+  // persona confirma — así, si no hay internet y el registro se sube más
+  // tarde, la hora que queda guardada es la real (cuándo llegó/se fue),
+  // no la hora en que por fin hubo señal.
+  const horaCaptura = new Date().toISOString();
+  const datosRegistro = {
+    accion: "registrar", codigo: codigoActual, pin: pinActual, tipoEvento: eventoElegido,
+    lat: coordenadas ? coordenadas.lat : "", lng: coordenadas ? coordenadas.lng : "",
+    precision: coordenadas ? coordenadas.precision : "", marcaClienteISO: horaCaptura
+  };
+
+  // Si el dispositivo ya sabe que no tiene conexión, ni siquiera se intenta
+  // — se encola directo para ahorrar la espera del error.
+  if(!navigator.onLine){
+    encolarRegistroOffline(datosRegistro, fotoCapturadaB64);
+    mostrarExitoOffline(horaCaptura);
+    boton.disabled = false;
+    boton.textContent = "Confirmar";
+    return;
+  }
+
   try{
     // El registro se envía SIN la foto — esto debe ser rápido y confiable siempre.
-    const resp = await fetch(URL_APPS_SCRIPT, {
-      method: "POST",
-      body: JSON.stringify({
-        accion: "registrar", codigo: codigoActual, pin: pinActual, tipoEvento: eventoElegido,
-        lat: coordenadas ? coordenadas.lat : "", lng: coordenadas ? coordenadas.lng : "",
-        precision: coordenadas ? coordenadas.precision : ""
-      })
-    });
+    const resp = await fetch(URL_APPS_SCRIPT, { method: "POST", body: JSON.stringify(datosRegistro) });
     const datos = await resp.json();
 
     // La foto se manda aparte, DESPUÉS, y no se espera su resultado — si tarda
@@ -488,14 +545,87 @@ document.getElementById('btn-confirmar').onclick = async () => {
     }, 3200);
 
   }catch(e){
-    alert("La conexión tardó más de lo normal. Tu registro probablemente SÍ se guardó — no vuelvas a marcar por las dudas. Si quieres confirmarlo, pregúntale a un socio que revise el panel.");
-    pinActual = ""; codigoActual = null; nombreActual = null; eventoElegido = null; coordenadas = null; fotoCapturadaB64 = null;
-    mostrarPantalla('pantalla-empleados');
+    // No pudo conectarse — en vez de solo avisar, guarda el registro en el
+    // propio celular para subirlo automáticamente cuando vuelva la señal.
+    encolarRegistroOffline(datosRegistro, fotoCapturadaB64);
+    mostrarExitoOffline(horaCaptura);
   } finally {
     boton.disabled = false;
     boton.textContent = "Confirmar";
   }
 };
+
+function mostrarExitoOffline(horaCaptura){
+  document.getElementById('exito-titulo').textContent = ETIQUETAS_EVENTOS[eventoElegido] + " guardada (sin conexión)";
+  document.getElementById('exito-detalle').textContent = nombreActual + " · " + new Date(horaCaptura).toLocaleTimeString('es-CO', {hour12:false});
+  const estadoUbic = document.getElementById('estado-ubicacion');
+  estadoUbic.textContent = "📴 Sin internet ahora mismo — se guardó en este celular y se subirá solo en cuanto haya señal. No vuelvas a marcar.";
+  estadoUbic.className = "estado-ubicacion falta";
+  const avisoPrevio = document.getElementById('aviso-turno');
+  if(avisoPrevio) avisoPrevio.remove();
+  mostrarPantalla('pantalla-exito');
+  setTimeout(()=>{
+    pinActual = ""; codigoActual = null; nombreActual = null; eventoElegido = null; coordenadas = null; fotoCapturadaB64 = null;
+    mostrarPantalla('pantalla-empleados');
+  }, 3200);
+}
+
+// ---------------- Cola de registros pendientes (modo sin conexión) ----------------
+const CLAVE_COLA_OFFLINE = "montana_cola_registros";
+
+function leerColaOffline(){
+  try{ return JSON.parse(localStorage.getItem(CLAVE_COLA_OFFLINE) || "[]"); }catch(e){ return []; }
+}
+function guardarColaOffline(cola){
+  localStorage.setItem(CLAVE_COLA_OFFLINE, JSON.stringify(cola));
+  actualizarIndicadorPendientes();
+}
+function encolarRegistroOffline(datosRegistro, fotoBase64){
+  const cola = leerColaOffline();
+  cola.push({ datos: datosRegistro, foto: fotoBase64 || null, intentos: 0 });
+  guardarColaOffline(cola);
+}
+
+function actualizarIndicadorPendientes(){
+  const cola = leerColaOffline();
+  const indicador = document.getElementById('indicador-pendientes');
+  if(!indicador) return;
+  if(cola.length === 0){ indicador.classList.add('oculto'); return; }
+  indicador.classList.remove('oculto');
+  indicador.textContent = "📴 " + cola.length + " registro(s) pendiente(s) de subir";
+}
+
+async function intentarSubirColaOffline(){
+  let cola = leerColaOffline();
+  if(cola.length === 0) return;
+  if(!navigator.onLine) return;
+
+  const pendientes = [];
+  for(const item of cola){
+    try{
+      const resp = await fetch(URL_APPS_SCRIPT, { method: "POST", body: JSON.stringify(item.datos) });
+      const datos = await resp.json();
+      if(!datos.ok){ item.intentos++; pendientes.push(item); continue; }
+      if(item.foto && datos.fila){
+        fetch(URL_APPS_SCRIPT, {
+          method: "POST",
+          body: JSON.stringify({ accion: "actualizarFotoRegistro", codigo: item.datos.codigo, pin: item.datos.pin, fila: datos.fila, foto: item.foto })
+        }).catch(()=>{});
+      }
+      // se subió bien — no se vuelve a agregar a "pendientes"
+    }catch(e){
+      item.intentos++;
+      pendientes.push(item); // sigue sin conexión, se queda en la cola
+    }
+  }
+  guardarColaOffline(pendientes);
+}
+
+// Reintenta subir la cola: al recuperar señal, y cada 20 segundos mientras la app esté abierta.
+window.addEventListener('online', intentarSubirColaOffline);
+setInterval(intentarSubirColaOffline, 20000);
+actualizarIndicadorPendientes();
+intentarSubirColaOffline();
 
 if('serviceWorker' in navigator){
   window.addEventListener('load', () => {

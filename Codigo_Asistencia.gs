@@ -245,6 +245,23 @@ function doGet(e) {
     return respuestaJson({ turnos: obtenerConfiguracionTurnos() });
   }
 
+  if (accion === "novedadesAnio") {
+    if (String(e.parameter.pin) !== PIN_PANEL_SOCIOS) return respuestaJson({ error: "PIN inválido" });
+    const anio = e.parameter.anio;
+    const novedadesRango = obtenerNovedadesRango(anio + "-01-01", anio + "-12-31");
+    const empleados = obtenerEmpleadosActivos();
+    const lista = [];
+    Object.keys(novedadesRango).forEach(codigo => {
+      const emp = empleados.find(x => x.codigo === codigo);
+      Object.keys(novedadesRango[codigo]).forEach(fecha => {
+        const n = novedadesRango[codigo][fecha];
+        lista.push({ codigo: codigo, nombre: emp ? emp.nombre : codigo, fecha: fecha, tipo: n.tipo, motivo: n.motivo, estado: n.estado, autorizadoPor: n.autorizadoPor });
+      });
+    });
+    lista.sort((a, b) => a.fecha < b.fecha ? -1 : 1);
+    return respuestaJson({ novedades: lista });
+  }
+
   return respuestaJson({ error: "Acción no reconocida" });
 }
 
@@ -474,6 +491,14 @@ function manejarGuardarNovedad(datos) {
   if (TIPOS_NOVEDAD_VALIDOS.indexOf(tipo) === -1) {
     return respuestaJson({ ok: false, error: "Tipo de novedad inválido" });
   }
+  const motivo = String(datos.motivo || "").trim();
+  if (!motivo) {
+    return respuestaJson({ ok: false, error: "La observación es obligatoria — explica qué pasó." });
+  }
+  const autorizadoPor = String(datos.autorizadoPor || "").trim();
+  if (!autorizadoPor) {
+    return respuestaJson({ ok: false, error: "Debes indicar quién autoriza esta novedad." });
+  }
   const empleado = buscarEmpleadoPorCodigo(datos.codigo);
   if (!empleado) {
     return respuestaJson({ ok: false, error: "Código no encontrado" });
@@ -483,10 +508,17 @@ function manejarGuardarNovedad(datos) {
   if (!hoja) {
     const libro = SpreadsheetApp.getActiveSpreadsheet();
     hoja = libro.insertSheet(NOMBRE_HOJA_NOVEDADES);
-    hoja.appendRow(["Codigo", "Fecha", "Tipo", "Motivo", "Creado_En", "Estado"]);
+    hoja.appendRow(["Codigo", "Fecha", "Tipo", "Motivo", "Creado_En", "Estado", "Autorizado_Por"]);
+  }
+  let colAutorizado = hoja.getDataRange().getValues()[0].indexOf("Autorizado_Por");
+  if (colAutorizado === -1) {
+    colAutorizado = hoja.getLastColumn();
+    hoja.getRange(1, colAutorizado + 1).setValue("Autorizado_Por");
   }
 
-  hoja.appendRow([datos.codigo, datos.fecha, tipo, datos.motivo || "", new Date(), "PENDIENTE"]);
+  const fila = [datos.codigo, datos.fecha, tipo, motivo, new Date(), "PENDIENTE"];
+  fila[colAutorizado] = autorizadoPor;
+  hoja.appendRow(fila);
   return respuestaJson({ ok: true });
 }
 
@@ -633,6 +665,7 @@ function obtenerNovedadesRango(fechaInicio, fechaFin) {
   const filas = hoja.getDataRange().getValues();
   const encabezados = filas[0];
   const colEstado = encabezados.indexOf("Estado");
+  const colAutorizado = encabezados.indexOf("Autorizado_Por");
   const resultado = {};
   for (let i = 1; i < filas.length; i++) {
     const codigo = filas[i][0];
@@ -642,7 +675,8 @@ function obtenerNovedadesRango(fechaInicio, fechaFin) {
     resultado[codigo][fecha] = {
       tipo: filas[i][2],
       motivo: filas[i][3] || "",
-      estado: (colEstado > -1 && filas[i][colEstado]) ? filas[i][colEstado] : "PENDIENTE"
+      estado: (colEstado > -1 && filas[i][colEstado]) ? filas[i][colEstado] : "PENDIENTE",
+      autorizadoPor: (colAutorizado > -1 && filas[i][colAutorizado]) ? filas[i][colAutorizado] : ""
     };
   }
   return resultado;
@@ -1364,11 +1398,16 @@ function calcularResumenAdmin(mesTexto) {
       let almuerzoNoMarcado = false;
       if (ev.ENTRADA !== undefined && ev.SALIDA !== undefined) {
         let minutosTrabajados = ev.SALIDA - ev.ENTRADA;
-        if (ev.SALIDA_ALMUERZO !== undefined && ev.REGRESO_ALMUERZO !== undefined) {
-          const almuerzoReal = ev.REGRESO_ALMUERZO - ev.SALIDA_ALMUERZO;
+        if (ev.SALIDA_ALMUERZO !== undefined) {
+          // Si marcó que salió a almorzar pero nunca marcó el regreso, se
+          // asume 0 minutos de almuerzo real marcado — igual se estira al
+          // mínimo acordado (el mismo cálculo de construirIntervalosTrabajo).
+          const regresoReal = ev.REGRESO_ALMUERZO !== undefined ? ev.REGRESO_ALMUERZO : ev.SALIDA_ALMUERZO;
+          const almuerzoReal = regresoReal - ev.SALIDA_ALMUERZO;
           minutosTrabajados -= Math.max(almuerzoReal, MINUTOS_MINIMOS_ALMUERZO);
+          if (ev.REGRESO_ALMUERZO === undefined) almuerzoNoMarcado = true; // marcó salida, pero no el regreso
         } else {
-          // Fue directo de Entrada a Salida sin marcar el almuerzo — se
+          // Fue directo de Entrada a Salida sin marcar ningún almuerzo — se
           // descuenta igual el mínimo acordado, para no pagarle de más.
           minutosTrabajados -= MINUTOS_MINIMOS_ALMUERZO;
           almuerzoNoMarcado = true;
@@ -1658,6 +1697,7 @@ function calcularHorasNoTrabajadasPeriodo(codigo, rango, horarioSemanal, eventos
   let diasIncompletos = 0;
   let diasConNovedad = 0;
   let diasTrabajados = 0;
+  const fechasAusenciaSinMarcar = []; // fechas exactas donde debía trabajar y no marcó nada, sin novedad
   const semanasConAusencia = {}; // semanaKey (lunes) -> true si esa semana tuvo al menos 1 ausencia injustificada
 
   const inicio = new Date(rango.inicio + "T00:00:00");
@@ -1688,8 +1728,9 @@ function calcularHorasNoTrabajadasPeriodo(codigo, rango, horarioSemanal, eventos
     let horasTrabajadas = 0;
     if (ev && ev.ENTRADA !== undefined && ev.SALIDA !== undefined) {
       let minutos = ev.SALIDA - ev.ENTRADA;
-      if (ev.SALIDA_ALMUERZO !== undefined && ev.REGRESO_ALMUERZO !== undefined) {
-        const almuerzoReal = ev.REGRESO_ALMUERZO - ev.SALIDA_ALMUERZO;
+      if (ev.SALIDA_ALMUERZO !== undefined) {
+        const regresoReal = ev.REGRESO_ALMUERZO !== undefined ? ev.REGRESO_ALMUERZO : ev.SALIDA_ALMUERZO;
+        const almuerzoReal = regresoReal - ev.SALIDA_ALMUERZO;
         minutos -= Math.max(almuerzoReal, MINUTOS_MINIMOS_ALMUERZO);
       } else {
         minutos -= MINUTOS_MINIMOS_ALMUERZO;
@@ -1703,6 +1744,7 @@ function calcularHorasNoTrabajadasPeriodo(codigo, rango, horarioSemanal, eventos
       horasFaltantes += deficit;
       if (horasTrabajadas === 0) {
         diasAusencia++;
+        fechasAusenciaSinMarcar.push(fechaStr);
         semanasConAusencia[lunesDeSemana(fechaStr)] = true; // ausencia completa injustificada esa semana
       } else {
         diasIncompletos++;
@@ -1726,7 +1768,8 @@ function calcularHorasNoTrabajadasPeriodo(codigo, rango, horarioSemanal, eventos
     diasConNovedad: diasConNovedad,
     diasTrabajados: diasTrabajados,
     semanasSinDescanso: semanasSinDescanso,
-    horasDescansoPerdido: Math.round(horasDescansoPerdido * 100) / 100
+    horasDescansoPerdido: Math.round(horasDescansoPerdido * 100) / 100,
+    fechasAusenciaSinMarcar: fechasAusenciaSinMarcar
   };
 }
 
@@ -1871,6 +1914,7 @@ function calcularResumenNomina(mesTexto, fechaInicio, fechaFin, divisorHorasPeri
       diasAusencia: infoFaltante.diasAusencia,
       diasIncompletos: infoFaltante.diasIncompletos,
       diasConNovedad: infoFaltante.diasConNovedad,
+      fechasAusenciaSinMarcar: infoFaltante.fechasAusenciaSinMarcar,
       diasTrabajados: infoFaltante.diasTrabajados,
       semanasSinDescanso: infoFaltante.semanasSinDescanso,
       horasDescansoPerdido: infoFaltante.horasDescansoPerdido
@@ -1885,10 +1929,27 @@ function calcularResumenNomina(mesTexto, fechaInicio, fechaFin, divisorHorasPeri
       const n = novedadesRango[codigo][fecha];
       novedadesDelPeriodo.push({
         codigo: codigo, nombre: emp ? emp.nombre : codigo, fecha: fecha,
-        tipo: n.tipo, motivo: n.motivo, estado: n.estado
+        tipo: n.tipo, motivo: n.motivo, estado: n.estado, autorizadoPor: n.autorizadoPor
       });
     });
   });
+
+  // También se incluyen los días donde alguien debía trabajar y no marcó
+  // nada, y no tiene ninguna novedad registrada que lo justifique — esto
+  // necesita que el administrador lo revise antes de cerrar la nómina
+  // (¿estaba enfermo y no avisó? ¿se le olvidó marcar? ¿no debía trabajar?).
+  detalle.forEach(d => {
+    (d.fechasAusenciaSinMarcar || []).forEach(fecha => {
+      const yaTieneNovedad = novedadesRango[d.codigo] && novedadesRango[d.codigo][fecha];
+      if (yaTieneNovedad) return; // ya está cubierto arriba
+      novedadesDelPeriodo.push({
+        codigo: d.codigo, nombre: d.nombre, fecha: fecha,
+        tipo: "AUSENCIA_SIN_MARCAR", motivo: "No hay ningún registro de marcación ese día y no tiene novedad justificada.",
+        estado: "PENDIENTE"
+      });
+    });
+  });
+
   novedadesDelPeriodo.sort((a, b) => a.fecha < b.fecha ? -1 : 1);
 
   return {
@@ -1964,13 +2025,19 @@ function esFestivoODomingo(fechaStr) {
 // Construye los tramos de tiempo efectivamente trabajados en el día
 // (antes y después del almuerzo, si hubo almuerzo registrado).
 function construirIntervalosTrabajo(entradaMin, salidaMin, salidaAlmMin, regresoAlmMin) {
-  if (salidaAlmMin !== undefined && regresoAlmMin !== undefined) {
-    const almuerzoReal = regresoAlmMin - salidaAlmMin;
+  if (salidaAlmMin !== undefined) {
+    // Si marcó que salió a almorzar pero nunca marcó el regreso (fue directo
+    // a Salida), se asume que el almuerzo real fue de 0 minutos marcados —
+    // igual se estira al mínimo acordado más abajo. Así el "hueco" del
+    // almuerzo queda en el momento correcto (cuando realmente salió), no
+    // recortado al final de la jornada.
+    const regresoReal = regresoAlmMin !== undefined ? regresoAlmMin : salidaAlmMin;
+    const almuerzoReal = regresoReal - salidaAlmMin;
     // Si el almuerzo real fue más corto que el mínimo acordado, se "estira"
     // el regreso efectivo para que el descuento total sea siempre el mínimo.
     const regresoEfectivo = almuerzoReal < MINUTOS_MINIMOS_ALMUERZO
       ? salidaAlmMin + MINUTOS_MINIMOS_ALMUERZO
-      : regresoAlmMin;
+      : regresoReal;
     if (regresoEfectivo >= salidaMin) {
       return [[entradaMin, salidaAlmMin]]; // el almuerzo mínimo ya cubre el resto del día
     }
@@ -2033,7 +2100,9 @@ function calcularProvisiones(mesTexto) {
   const ultimoDiaMes = new Date(primerDiaMes.getFullYear(), primerDiaMes.getMonth() + 1, 0);
   const diasDelMes = ultimoDiaMes.getDate();
 
-  const detalle = empleados.map(emp => {
+  const detalle = empleados
+    .filter(emp => emp.tipoPersonal !== "TURNO") // los turneros no provisionan — se les paga el día, sin prestaciones acumulables
+    .map(emp => {
     if (!emp.salarioMensual || emp.salarioMensual <= 0) {
       return { codigo: emp.codigo, nombre: emp.nombre, sinSalario: true };
     }
