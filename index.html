@@ -204,6 +204,10 @@
         </div>
         <canvas id="canvas-foto" class="oculto"></canvas>
 
+        <div id="aviso-evento-incierto" class="oculto" style="background:rgba(240,185,30,0.15);border:1px solid var(--brasa-suave);color:var(--brasa-suave);border-radius:10px;padding:10px 14px;margin:0 16px 10px;font-size:13px;text-align:center;">
+          ⚠️ Sin conexión no sabemos cuál fue tu última marca. Revisa abajo y toca la opción correcta antes de confirmar.
+        </div>
+
         <div id="bloque-otras-opciones" class="oculto">
           <div class="opciones-evento" id="opciones-evento"></div>
         </div>
@@ -400,7 +404,18 @@ function prepararConfirmacion(ultimoEvento){
   eventoElegido = siguienteEvento(ultimoEvento);
   document.getElementById('evento-sugerido').textContent = ETIQUETAS_EVENTOS[eventoElegido];
   document.getElementById('hora-confirmar').textContent = nombreActual + " · " + new Date().toLocaleTimeString('es-CO', {hour12:false});
-  document.getElementById('bloque-otras-opciones').classList.add('oculto');
+
+  const avisoIncertidumbre = document.getElementById('aviso-evento-incierto');
+  if(ultimoEvento === null || ultimoEvento === undefined){
+    // No sabemos cuál fue tu última marca (típicamente porque estamos sin
+    // conexión) — en vez de asumir "Entrada" en silencio, se muestran las
+    // opciones abiertas de una vez para que la persona confirme cuál es.
+    document.getElementById('bloque-otras-opciones').classList.remove('oculto');
+    if(avisoIncertidumbre) avisoIncertidumbre.classList.remove('oculto');
+  } else {
+    document.getElementById('bloque-otras-opciones').classList.add('oculto');
+    if(avisoIncertidumbre) avisoIncertidumbre.classList.add('oculto');
+  }
 
   const cont = document.getElementById('opciones-evento');
   cont.innerHTML = "";
@@ -502,6 +517,16 @@ document.getElementById('btn-confirmar').onclick = async () => {
     const resp = await fetch(URL_APPS_SCRIPT, { method: "POST", body: JSON.stringify(datosRegistro) });
     const datos = await resp.json();
 
+    if(datos.ok === false){
+      // El backend rechazó el registro a propósito (ej. todavía falta para
+      // la hora del turno) — esto no es un problema de conexión, así que
+      // se muestra tal cual y no se encola nada.
+      alert(datos.error || "No se pudo registrar.");
+      boton.disabled = false;
+      boton.textContent = "Confirmar";
+      return;
+    }
+
     // La foto se manda aparte, DESPUÉS, y no se espera su resultado — si tarda
     // o falla, el registro ya quedó guardado de todas formas.
     if(fotoCapturadaB64 && datos.fila){
@@ -598,7 +623,11 @@ function actualizarIndicadorPendientes(){
 async function intentarSubirColaOffline(){
   let cola = leerColaOffline();
   if(cola.length === 0) return;
-  if(!navigator.onLine) return;
+  // OJO: no revisamos navigator.onLine aquí a propósito — esa propiedad del
+  // navegador no es confiable (en varios celulares, sobre todo iPhone, se
+  // queda diciendo "sin conexión" aunque ya haya vuelto la señal). Es más
+  // seguro simplemente intentar el envío real y dejar que el propio fetch
+  // decida si hay conexión o no.
 
   const pendientes = [];
   for(const item of cola){
