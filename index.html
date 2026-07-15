@@ -376,16 +376,17 @@ async function verificarPin(){
     }
     recordarPinVerificado(codigoActual, pinActual); // para poder validar sin conexión la próxima vez
     document.getElementById('error-pin').textContent = "";
-    prepararConfirmacion(datos.ultimoEvento);
+    prepararConfirmacion(datos.ultimoEvento, false); // hay conexión: aunque no haya marca previa, se sabe con certeza
   }catch(e){
     // Sin conexión para verificar en vivo — revisa si esta clave ya se
     // verificó antes en este mismo celular (la última vez que sí hubo señal).
     const guardados = leerPinsVerificados();
     if(guardados[codigoActual] !== undefined && String(guardados[codigoActual]) === String(pinActual)){
       document.getElementById('error-pin').textContent = "";
-      // Sin conexión no sabemos cuál fue tu última marca — el sistema
-      // sugiere "Entrada" por defecto, pero puedes elegir otra abajo si no es la correcta.
-      prepararConfirmacion(null);
+      // Aquí sí es incertidumbre real: sin conexión no hay forma de saber
+      // cuál fue tu última marca — el sistema sugiere "Entrada" por defecto,
+      // pero muestra las opciones abiertas para que confirmes cuál es.
+      prepararConfirmacion(null, true);
     } else {
       document.getElementById('error-pin').textContent = "Sin conexión, y esta clave no se había usado antes en este celular. Conéctate al menos una vez para poder marcar sin internet después.";
       pinActual = ""; actualizarVisorPin();
@@ -400,16 +401,18 @@ function siguienteEvento(ultimo){
   return SECUENCIA_EVENTOS[idx + 1];
 }
 
-function prepararConfirmacion(ultimoEvento){
+function prepararConfirmacion(ultimoEvento, incierto){
   eventoElegido = siguienteEvento(ultimoEvento);
   document.getElementById('evento-sugerido').textContent = ETIQUETAS_EVENTOS[eventoElegido];
   document.getElementById('hora-confirmar').textContent = nombreActual + " · " + new Date().toLocaleTimeString('es-CO', {hour12:false});
 
   const avisoIncertidumbre = document.getElementById('aviso-evento-incierto');
-  if(ultimoEvento === null || ultimoEvento === undefined){
-    // No sabemos cuál fue tu última marca (típicamente porque estamos sin
-    // conexión) — en vez de asumir "Entrada" en silencio, se muestran las
-    // opciones abiertas de una vez para que la persona confirme cuál es.
+  if(incierto === true){
+    // Esto SOLO pasa cuando no hay conexión y no se pudo confirmar en vivo
+    // cuál fue la última marca — ahí sí conviene mostrar las opciones
+    // abiertas para que la persona confirme cuál es. Si hay conexión y
+    // simplemente no hay marca previa (ej. la primera entrada del día),
+    // eso no es incertidumbre — se sabe con certeza que es Entrada.
     document.getElementById('bloque-otras-opciones').classList.remove('oculto');
     if(avisoIncertidumbre) avisoIncertidumbre.classList.remove('oculto');
   } else {
