@@ -27,9 +27,18 @@ const NOMBRE_HOJA_NOVEDADES = "Novedades";
 // Colombia y desfasar todas las horas registradas.
 const ZONA_HORARIA_MONTANA = "America/Bogota";
 
-const HORA_INICIO_APERTURA = 9;   // 9:00 a.m. → sale 5:00 p.m.
-const HORA_INICIO_MEDIO = 10;     // 10:00 a.m. → sale 6:00 p.m.
-const HORA_INICIO_CIERRE = 11;    // 11:00 a.m. → sale 7:00 p.m.
+// Valores por defecto de cada turno — se pueden cambiar desde la pestaña
+// "Configuración" del panel sin tocar el código (quedan guardados en
+// PropertiesService). "horas" es cuánto se le paga (7 para jornada de 42h,
+// 6 para jornada de 36h/6x6).
+const TURNOS_POR_DEFECTO = {
+  APERTURA:  { horaInicio: 9,  horas: 7, jornada: "42" },
+  MEDIO:     { horaInicio: 10, horas: 7, jornada: "42" },
+  CIERRE:    { horaInicio: 11, horas: 7, jornada: "42" },
+  APERTURA36:{ horaInicio: 9,  horas: 6, jornada: "36" },
+  MEDIO36:   { horaInicio: 11, horas: 6, jornada: "36" },
+  CIERRE36:  { horaInicio: 13, horas: 6, jornada: "36" }
+};
 const TOLERANCIA_TARDE_MIN = 10;
 
 // Límites legales de horas extra (Art. 22 CST) — esto SÍ es una violación,
@@ -38,13 +47,47 @@ const TOLERANCIA_TARDE_MIN = 10;
 const LIMITE_EXTRA_DIARIA_HORAS = 2;
 const LIMITE_EXTRA_SEMANAL_HORAS = 12;
 
-function horaInicioTurno(turno) {
-  if (turno === "APERTURA") return HORA_INICIO_APERTURA;
-  if (turno === "MEDIO") return HORA_INICIO_MEDIO;
-  if (turno === "CIERRE") return HORA_INICIO_CIERRE;
-  return null;
+// Lee la configuración de turnos guardada (o los valores por defecto si
+// todavía no se ha guardado nada). Se cachea en memoria durante la misma
+// ejecución para no leer PropertiesService varias veces.
+let _configTurnosCache = null;
+function obtenerConfiguracionTurnos() {
+  if (_configTurnosCache) return _configTurnosCache;
+  const guardado = PropertiesService.getScriptProperties().getProperty("config_turnos");
+  _configTurnosCache = guardado ? JSON.parse(guardado) : JSON.parse(JSON.stringify(TURNOS_POR_DEFECTO));
+  return _configTurnosCache;
 }
-const HORAS_PAGAS_POR_TURNO = 7;
+function guardarConfiguracionTurnos(config) {
+  PropertiesService.getScriptProperties().setProperty("config_turnos", JSON.stringify(config));
+  _configTurnosCache = config;
+}
+
+function horaInicioTurno(turno) {
+  const config = obtenerConfiguracionTurnos();
+  return config[turno] ? config[turno].horaInicio : null;
+}
+function horasPorTurno(turno) {
+  const config = obtenerConfiguracionTurnos();
+  return config[turno] ? config[turno].horas : HORAS_PAGAS_POR_TURNO; // LIBRE u otro valor raro -> por defecto
+}
+function jornadaDeTurno(turno) {
+  const config = obtenerConfiguracionTurnos();
+  return config[turno] ? config[turno].jornada : "42";
+}
+function esTurnoValido(turno) {
+  const config = obtenerConfiguracionTurnos();
+  return !!config[turno];
+}
+
+// Un empleado "es" de jornada 6x6 si en su horario semanal tiene asignado
+// cualquier turno de la familia 36h (APERTURA36/MEDIO36/CIERRE36).
+function empleadoTieneJornada36(codigo, horarioSemanal) {
+  const horarioEmp = horarioSemanal[codigo];
+  if (!horarioEmp) return false;
+  return Object.values(horarioEmp).some(turno => esTurnoValido(turno) && jornadaDeTurno(turno) === "36");
+}
+
+const HORAS_PAGAS_POR_TURNO = 7; // referencia para jornada de 42h — para 36h usar horasPorTurno(turno)
 
 // ⚠️ Acuerdo con el equipo: aunque el almuerzo real marcado sea más corto
 // (ej. 30 min), siempre se descuenta como mínimo esta cantidad de las horas
@@ -197,6 +240,11 @@ function doGet(e) {
     return respuestaJson(calcularProvisiones(mes));
   }
 
+  if (accion === "obtenerConfiguracionTurnos") {
+    if (String(e.parameter.pin) !== PIN_PANEL_SOCIOS) return respuestaJson({ error: "PIN inválido" });
+    return respuestaJson({ turnos: obtenerConfiguracionTurnos() });
+  }
+
   return respuestaJson({ error: "Acción no reconocida" });
 }
 
@@ -221,6 +269,13 @@ function doPost(e) {
   if (datos.accion === "cerrarPeriodoNomina") return manejarCerrarPeriodoNomina(datos);
   if (datos.accion === "guardarNovedad") return manejarGuardarNovedad(datos);
   if (datos.accion === "actualizarEstadoNovedad") return manejarActualizarEstadoNovedad(datos);
+  if (datos.accion === "guardarConfiguracionTurnos") return manejarGuardarConfiguracionTurnos(datos);
+  if (datos.accion === "actualizarCategoriaEmpleado") return manejarActualizarCategoriaEmpleado(datos);
+  if (datos.accion === "cerrarTurnosAbandonadosManual") {
+    if (String(datos.pinSocios) !== PIN_PANEL_SOCIOS) return respuestaJson({ ok: false, error: "PIN de socios inválido" });
+    const cerrados = cerrarTurnosAbandonados();
+    return respuestaJson({ ok: true, cerrados: cerrados });
+  }
 
   return respuestaJson({ error: "Acción no reconocida" });
 }
@@ -247,8 +302,26 @@ function manejarRegistrar(datos) {
   }
 
   const hoja = obtenerHoja(NOMBRE_HOJA_REGISTRO);
-  const ahora = new Date();
+  const ahoraServidor = new Date();
   const zona = ZONA_HORARIA_MONTANA;
+
+  // Si el kiosko no tenía internet en el momento de marcar, el registro se
+  // guardó localmente en el celular y se sube después con "marcaClienteISO"
+  // — la hora que se guarda es la real (cuándo la persona marcó), no la
+  // hora en que por fin hubo señal. Queda constancia clara de esto en
+  // Observaciones, para que sea transparente y revisable.
+  let ahora = ahoraServidor;
+  let notaSincronizacionOffline = "";
+  if (datos.marcaClienteISO) {
+    const fechaCliente = new Date(datos.marcaClienteISO);
+    if (!isNaN(fechaCliente.getTime())) {
+      ahora = fechaCliente;
+      const diferenciaMin = Math.round((ahoraServidor - fechaCliente) / 60000);
+      if (diferenciaMin > 2) {
+        notaSincronizacionOffline = "SINCRONIZADO_OFFLINE: marcado sin conexión, subido " + diferenciaMin + " min después (" + Utilities.formatDate(ahoraServidor, zona, "yyyy-MM-dd HH:mm") + ")";
+      }
+    }
+  }
 
   // Si el cálculo de alertas falla por cualquier motivo (turno mal configurado,
   // hoja de excepciones con datos raros, etc.), el registro se debe guardar
@@ -258,6 +331,9 @@ function manejarRegistrar(datos) {
     alertas = calcularAlertas(datos.codigo, datos.tipoEvento, ahora);
   } catch (errorAlertas) {
     alertas = { observaciones: "ERROR_AL_CALCULAR_ALERTA: " + errorAlertas.message, mensajeParaKiosko: "" };
+  }
+  if (notaSincronizacionOffline) {
+    alertas.observaciones = (alertas.observaciones ? alertas.observaciones + " | " : "") + notaSincronizacionOffline;
   }
 
   // La foto se sube DESPUÉS, en una llamada aparte (ver manejarActualizarFotoRegistro
@@ -449,6 +525,106 @@ function manejarActualizarEstadoNovedad(datos) {
   return respuestaJson({ ok: false, error: "No se encontró esa novedad" });
 }
 
+// ---------------------------------------------------------
+// Configuración de turnos (pestaña Configuración del panel):
+// cambia la hora de inicio de cualquiera de los 6 turnos
+// (3 de jornada 42h, 3 de jornada 36h/6x6).
+// ---------------------------------------------------------
+// ---------------------------------------------------------
+// Categoría de empleado (pestaña Configuración): una sola opción que
+// resume las 3 cosas que hoy viven en lugares separados — Cargo_Confianza,
+// Tipo_Personal, y la jornada (42h/36h, que en realidad se guarda como el
+// turno asignado día a día en Horario_Semanal). Al elegir 42h o 36h aquí,
+// convierte automáticamente todos los turnos ya asignados de esa persona
+// a la familia correspondiente (Apertura/Medio/Cierre se preservan, solo
+// cambia si es la versión de 42h o la de 36h) — así no hay que ir día por
+// día reprogramando en "Turnos y personal".
+// ---------------------------------------------------------
+const MAPA_TURNO_A_FAMILIA = {
+  APERTURA:   { "42": "APERTURA", "36": "APERTURA36" },
+  MEDIO:      { "42": "MEDIO",    "36": "MEDIO36" },
+  CIERRE:     { "42": "CIERRE",   "36": "CIERRE36" },
+  APERTURA36: { "42": "APERTURA", "36": "APERTURA36" },
+  MEDIO36:    { "42": "MEDIO",    "36": "MEDIO36" },
+  CIERRE36:   { "42": "CIERRE",   "36": "CIERRE36" }
+};
+const CATEGORIAS_EMPLEADO_VALIDAS = ["PLANTA_42", "PLANTA_36", "TURNO", "CONFIANZA"];
+
+function manejarActualizarCategoriaEmpleado(datos) {
+  if (String(datos.pinSocios) !== PIN_PANEL_SOCIOS) {
+    return respuestaJson({ ok: false, error: "PIN de socios inválido" });
+  }
+  const categoria = String(datos.categoria || "").toUpperCase().trim();
+  if (CATEGORIAS_EMPLEADO_VALIDAS.indexOf(categoria) === -1) {
+    return respuestaJson({ ok: false, error: "Categoría no válida" });
+  }
+
+  const hojaEmp = obtenerHoja(NOMBRE_HOJA_EMPLEADOS);
+  const filasEmp = hojaEmp.getDataRange().getValues();
+  const encabezadosEmp = filasEmp[0];
+  let colConfianza = encabezadosEmp.indexOf("Cargo_Confianza");
+  let colTipoPersonal = encabezadosEmp.indexOf("Tipo_Personal");
+  if (colConfianza === -1) {
+    colConfianza = hojaEmp.getLastColumn();
+    hojaEmp.getRange(1, colConfianza + 1).setValue("Cargo_Confianza");
+  }
+  if (colTipoPersonal === -1) {
+    colTipoPersonal = hojaEmp.getLastColumn();
+    hojaEmp.getRange(1, colTipoPersonal + 1).setValue("Tipo_Personal");
+  }
+
+  let filaEmpleado = -1;
+  for (let i = 1; i < filasEmp.length; i++) {
+    if (filasEmp[i][0] === datos.codigo) { filaEmpleado = i + 1; break; }
+  }
+  if (filaEmpleado === -1) return respuestaJson({ ok: false, error: "Código no encontrado" });
+
+  const esConfianza = categoria === "CONFIANZA";
+  const esTurno = categoria === "TURNO";
+  hojaEmp.getRange(filaEmpleado, colConfianza + 1).setValue(esConfianza);
+  hojaEmp.getRange(filaEmpleado, colTipoPersonal + 1).setValue(esTurno ? "TURNO" : "PLANTA");
+
+  if (categoria === "PLANTA_42" || categoria === "PLANTA_36") {
+    const jornadaDestino = categoria === "PLANTA_42" ? "42" : "36";
+    const hojaHorario = obtenerHoja(NOMBRE_HOJA_HORARIO);
+    const filasHorario = hojaHorario.getDataRange().getValues();
+    const encabezadosHorario = filasHorario[0];
+    for (let i = 1; i < filasHorario.length; i++) {
+      if (filasHorario[i][0] !== datos.codigo) continue;
+      for (let c = 1; c < encabezadosHorario.length; c++) {
+        const turnoActual = String(filasHorario[i][c] || "LIBRE").toUpperCase().trim();
+        if (turnoActual === "LIBRE" || !MAPA_TURNO_A_FAMILIA[turnoActual]) continue;
+        const nuevoTurno = MAPA_TURNO_A_FAMILIA[turnoActual][jornadaDestino];
+        if (nuevoTurno && nuevoTurno !== turnoActual) {
+          hojaHorario.getRange(i + 1, c + 1).setValue(nuevoTurno);
+        }
+      }
+      break;
+    }
+  }
+
+  return respuestaJson({ ok: true });
+}
+
+function manejarGuardarConfiguracionTurnos(datos) {
+  if (String(datos.pinSocios) !== PIN_PANEL_SOCIOS) {
+    return respuestaJson({ ok: false, error: "PIN de socios inválido" });
+  }
+  if (!datos.turno || typeof datos.horaInicio !== "number") {
+    return respuestaJson({ ok: false, error: "Faltan datos (turno, horaInicio)" });
+  }
+  const config = obtenerConfiguracionTurnos();
+  if (!config[datos.turno]) {
+    return respuestaJson({ ok: false, error: "Ese turno no existe" });
+  }
+  if (datos.horaInicio < 0 || datos.horaInicio > 23) {
+    return respuestaJson({ ok: false, error: "La hora debe estar entre 0 y 23" });
+  }
+  config[datos.turno].horaInicio = datos.horaInicio;
+  guardarConfiguracionTurnos(config);
+  return respuestaJson({ ok: true });
+}
+
 // Devuelve, para un rango de fechas, qué días de cada empleado
 // tienen una novedad registrada: { codigo: { fecha: tipo } }
 function obtenerNovedadesRango(fechaInicio, fechaFin) {
@@ -503,8 +679,16 @@ function manejarCerrarPeriodoNomina(datos) {
       "Fecha_Cierre", "Periodo", "Periodo_Inicio", "Periodo_Fin", "Codigo", "Nombre", "Cargo",
       "Sueldo_Basico", "Auxilio_Transporte", "HED", "HEN", "Recargo_Nocturno",
       "Recargo_DomFest_Diurno", "Recargo_DomFest_Nocturno", "HED_DomFest", "HEN_DomFest",
-      "Total_Devengado", "Salud", "Pension", "Total_Deducido", "Neto_Pagado"
+      "Total_Devengado", "Salud", "Pension", "Total_Deducido", "Neto_Pagado", "Tipo_Personal"
     ]);
+  }
+  // Si la hoja ya existía de antes (sin esta columna), la agrega ahora al final
+  // — así los períodos que ya cerraste antes no se pierden ni se dañan, solo
+  // quedan sin ese dato (se muestran como "Planta" por defecto al leerlos).
+  let colTipoPersonal = hoja.getDataRange().getValues()[0].indexOf("Tipo_Personal");
+  if (colTipoPersonal === -1) {
+    colTipoPersonal = hoja.getLastColumn();
+    hoja.getRange(1, colTipoPersonal + 1).setValue("Tipo_Personal");
   }
 
   // Evita cerrar el mismo período dos veces para la misma persona sin darse cuenta.
@@ -515,13 +699,15 @@ function manejarCerrarPeriodoNomina(datos) {
 
   const ahora = new Date();
   datos.registros.forEach(r => {
-    hoja.appendRow([
+    const fila = [
       ahora, datos.periodoEtiqueta, datos.periodoInicio, datos.periodoFin,
       r.codigo, r.nombre, r.cargo || "",
       r.sueldoBasico || 0, r.auxTransporte || 0, r.valHED || 0, r.valHEN || 0, r.valHRN || 0,
       r.valHRDF || 0, r.valHRNDF || 0, r.valHEDF || 0, r.valHENF || 0,
       r.totalDevengado || 0, r.salud || 0, r.pension || 0, r.totalDeducido || 0, r.neto || 0
-    ]);
+    ];
+    fila[colTipoPersonal] = r.tipo || "PLANTA"; // "PLANTA" | "TURNO" | "6X6"
+    hoja.appendRow(fila);
   });
 
   return respuestaJson({ ok: true, guardados: datos.registros.length });
@@ -543,6 +729,7 @@ function obtenerHistorialNomina() {
   const filas = hoja.getDataRange().getValues();
   const zona = ZONA_HORARIA_MONTANA;
   const porPeriodo = {};
+  const colTipoPersonal = filas[0].indexOf("Tipo_Personal"); // -1 si es un historial de antes de este cambio
 
   for (let i = 1; i < filas.length; i++) {
     const fila = filas[i];
@@ -557,7 +744,8 @@ function obtenerHistorialNomina() {
     }
     porPeriodo[periodo].registros.push({
       codigo: fila[4], nombre: fila[5], cargo: fila[6],
-      sueldoBasico: fila[7], auxTransporte: fila[8], neto: fila[19], totalDevengado: fila[16]
+      sueldoBasico: fila[7], auxTransporte: fila[8], neto: fila[19], totalDevengado: fila[16],
+      tipoPersonal: (colTipoPersonal > -1 && fila[colTipoPersonal]) ? fila[colTipoPersonal] : "PLANTA"
     });
   }
 
@@ -615,7 +803,7 @@ function manejarActualizarHorario(datos) {
   if (String(datos.pinSocios) !== PIN_PANEL_SOCIOS) {
     return respuestaJson({ ok: false, error: "PIN de socios inválido" });
   }
-  const valoresValidos = ["APERTURA", "MEDIO", "CIERRE", "LIBRE"];
+  const valoresValidos = ["APERTURA", "MEDIO", "CIERRE", "APERTURA36", "MEDIO36", "CIERRE36", "LIBRE"];
   const nuevoTurno = String(datos.nuevoTurno).toUpperCase().trim();
   if (valoresValidos.indexOf(nuevoTurno) === -1) {
     return respuestaJson({ ok: false, error: "Turno inválido, debe ser APERTURA, CIERRE o LIBRE" });
@@ -723,6 +911,29 @@ function obtenerExcepcionHorario(codigo, fechaTexto) {
   return encontrada;
 }
 
+// Igual que obtenerExcepcionHorario, pero lee la hoja de Excepciones_Horario
+// UNA SOLA VEZ para todo un rango de fechas, en vez de una vez por cada
+// día de cada empleado (que es lo que la hacía tan lenta antes).
+// Devuelve { codigo: { fecha: {horaEntrada, horaSalida, motivo} } }
+function obtenerExcepcionesRango(fechaInicio, fechaFin) {
+  const hoja = obtenerHojaOpcional(NOMBRE_HOJA_EXCEPCIONES);
+  if (!hoja) return {};
+  const filas = hoja.getDataRange().getValues();
+  const resultado = {};
+  for (let i = 1; i < filas.length; i++) {
+    const codigo = filas[i][0];
+    const fecha = normalizarFecha(filas[i][1]);
+    if (!fecha || fecha < fechaInicio || fecha > fechaFin) continue;
+    if (!resultado[codigo]) resultado[codigo] = {};
+    resultado[codigo][fecha] = {
+      horaEntrada: normalizarHora(filas[i][2]),
+      horaSalida: normalizarHora(filas[i][3]),
+      motivo: filas[i][4] || ""
+    };
+  }
+  return resultado;
+}
+
 // Google Sheets a veces convierte automáticamente un texto "HH:mm" en un
 // valor de hora real (un objeto Date con fecha 30-dic-1899, el "cero" de
 // Sheets). Si luego se lee con String(), sale algo como
@@ -786,6 +997,82 @@ function obtenerEmpleadosActivos() {
     }
   }
   return resultado;
+}
+
+// ---------------------------------------------------------
+// Cierra automáticamente los turnos "abandonados": alguien marcó Entrada
+// pero nunca marcó Salida (ni almuerzo) ese día, y ya pasó a un día distinto
+// al de hoy. Sin esto, el sistema pensaría que la persona sigue trabajando
+// para siempre, y el día siguiente arrancaría con datos pegados del anterior.
+//
+// Solo toca días ANTERIORES a hoy — nunca el día de hoy, para no cerrarle
+// el turno a alguien que legítimamente sigue trabajando en este momento.
+//
+// ⚠️ Esta función necesita un disparador de tiempo para ejecutarse sola.
+// Configúralo una sola vez: en el editor de Apps Script, ícono del reloj
+// (⏱️ Activadores) → Añadir activador → función "cerrarTurnosAbandonados"
+// → Basado en tiempo → Temporizador diario → elige un horario como 2–3 a.m.
+// ---------------------------------------------------------
+function cerrarTurnosAbandonados() {
+  const zona = ZONA_HORARIA_MONTANA;
+  const hoy = Utilities.formatDate(new Date(), zona, "yyyy-MM-dd");
+
+  // Solo revisa los últimos 10 días hacia atrás — de sobra para este caso,
+  // y evita releer todo el histórico completo cada vez que corre.
+  const hace10Dias = new Date();
+  hace10Dias.setDate(hace10Dias.getDate() - 10);
+  const fechaInicio = Utilities.formatDate(hace10Dias, zona, "yyyy-MM-dd");
+
+  const eventos = construirEventosPorDia(null, fechaInicio, hoy);
+  const empleados = obtenerEmpleadosActivos();
+  const horarioSemanal = obtenerHorarioSemanalCompleto();
+  const excepcionesRango = obtenerExcepcionesRango(fechaInicio, hoy);
+  const hoja = obtenerHoja(NOMBRE_HOJA_REGISTRO);
+
+  let cerrados = 0;
+
+  Object.keys(eventos).forEach(codigo => {
+    Object.keys(eventos[codigo]).forEach(fecha => {
+      if (fecha >= hoy) return; // nunca tocar hoy ni el futuro
+      const ev = eventos[codigo][fecha];
+      if (ev.ENTRADA === undefined || ev.SALIDA !== undefined) return; // ya está completo, o ni siquiera entró
+
+      // Calcula a qué hora debía terminar ese turno, para usarla como hora
+      // de cierre automático (así el reporte de horas queda razonable, no
+      // en 0 ni contando de más).
+      const diaNombre = DIAS_SEMANA_LUN_A_DOM[diaDeSemanaLunesA0(fecha)];
+      const excepcion = excepcionesRango[codigo] && excepcionesRango[codigo][fecha];
+      const turno = excepcion ? null : ((horarioSemanal[codigo] || {})[diaNombre] || "LIBRE");
+
+      let horaFinMin;
+      if (excepcion && excepcion.horaSalida) {
+        const [hs, ms] = excepcion.horaSalida.split(":").map(Number);
+        horaFinMin = hs * 60 + ms;
+      } else if (turno && esTurnoValido(turno)) {
+        horaFinMin = (horaInicioTurno(turno) + horasPorTurno(turno) + 1) * 60; // +1h de almuerzo
+      } else {
+        horaFinMin = ev.ENTRADA + 8 * 60; // sin turno identificable: 8h después de la entrada, como respaldo
+      }
+      horaFinMin = horaFinMin % (24 * 60);
+      const horaFinTexto = String(Math.floor(horaFinMin / 60)).padStart(2, "0") + ":" + String(horaFinMin % 60).padStart(2, "0") + ":00";
+
+      const empleado = empleados.find(e => e.codigo === codigo);
+      hoja.appendRow([
+        new Date(),
+        "'" + fecha,
+        "'" + horaFinTexto,
+        codigo,
+        empleado ? empleado.nombre : codigo,
+        "SALIDA",
+        "", "", "",
+        "CIERRE_AUTOMATICO: no marcó Salida el " + fecha + " — el sistema lo cerró solo al final del turno esperado (" + horaFinTexto.slice(0, 5) + "). Revisa con la persona qué pasó ese día.",
+        ""
+      ]);
+      cerrados++;
+    });
+  });
+
+  return cerrados;
 }
 
 function buscarEmpleadoPorCodigo(codigo) {
@@ -1014,6 +1301,7 @@ function calcularBitacoraDia(fecha) {
   const horarioSemanal = obtenerHorarioSemanalCompleto();
   const diaNombre = DIAS_SEMANA_LUN_A_DOM[diaDeSemanaLunesA0(fecha)];
   const novedadesRango = obtenerNovedadesRango(fecha, fecha);
+  const excepcionesRango = obtenerExcepcionesRango(fecha, fecha);
 
   const hoja = obtenerHoja(NOMBRE_HOJA_REGISTRO);
   const filas = hoja.getDataRange().getValues();
@@ -1037,7 +1325,7 @@ function calcularBitacoraDia(fecha) {
 
   const resultado = empleados.map(emp => {
     const turnoNormal = (horarioSemanal[emp.codigo] || {})[diaNombre] || "LIBRE";
-    const excepcion = obtenerExcepcionHorario(emp.codigo, fecha);
+    const excepcion = (excepcionesRango[emp.codigo] && excepcionesRango[emp.codigo][fecha]) || null;
     const novedadesDelDia = novedadesRango[emp.codigo] && novedadesRango[emp.codigo][fecha];
     return {
       codigo: emp.codigo, nombre: emp.nombre, cargo: emp.cargo,
@@ -1100,17 +1388,25 @@ function calcularResumenAdmin(mesTexto) {
       const diaNombre = DIAS_SEMANA_LUN_A_DOM[diaDeSemanaLunesA0(fecha)];
       const turno = (horarioSemanal[codigo] || {})[diaNombre] || "LIBRE";
       const ajustado = ev._ajustado === true;
-      const horasExtraDia = horas !== null ? Math.max(0, Math.round((horas - HORAS_PAGAS_POR_TURNO) * 100) / 100) : 0;
+      const cierreAutomatico = ev._cierreAutomatico === true;
+      const horasEsperadasDia = esTurnoValido(turno) ? horasPorTurno(turno) : HORAS_PAGAS_POR_TURNO;
+      const horasExtraDia = horas !== null ? Math.max(0, Math.round((horas - horasEsperadasDia) * 100) / 100) : 0;
       const excepcionDia = (excepciones[fecha] && excepciones[fecha][codigo]) || null;
 
       if (!diario[fecha]) diario[fecha] = {};
-      diario[fecha][codigo] = { horas: horas, incompleto: incompleto, turno: turno, ajustado: ajustado, horasExtra: horasExtraDia, excepcion: excepcionDia, parcial: parcial, almuerzoNoMarcado: almuerzoNoMarcado };
+      diario[fecha][codigo] = { horas: horas, incompleto: incompleto, turno: turno, ajustado: ajustado, cierreAutomatico: cierreAutomatico, horasExtra: horasExtraDia, excepcion: excepcionDia, parcial: parcial, almuerzoNoMarcado: almuerzoNoMarcado };
 
       if (horas !== null) {
         mensual[codigo] = Math.round(((mensual[codigo] || 0) + horas) * 100) / 100;
         mensualExtra[codigo] = Math.round(((mensualExtra[codigo] || 0) + horasExtraDia) * 100) / 100;
 
-        if (horasExtraDia > LIMITE_EXTRA_DIARIA_HORAS) {
+        if (esTurnoValido(turno) && jornadaDeTurno(turno) === "36" && horasExtraDia > 0) {
+          const emp = empleados.find(e => e.codigo === codigo);
+          alertasLegales.push({
+            tipo: "VIOLACION_6X6", codigo: codigo, nombre: emp ? emp.nombre : codigo,
+            fecha: fecha, horasExtra: horasExtraDia, limite: 0
+          });
+        } else if (horasExtraDia > LIMITE_EXTRA_DIARIA_HORAS) {
           const emp = empleados.find(e => e.codigo === codigo);
           if (!emp || !emp.esConfianza) {
             alertasLegales.push({
@@ -1133,18 +1429,24 @@ function calcularResumenAdmin(mesTexto) {
     const tope = semanalTope[semanaKey];
     Object.keys(semanal[semanaKey]).forEach(codigo => {
       const horas = semanal[semanaKey][codigo];
-      if (horas > tope) {
+      const empleadoEs36 = empleadoTieneJornada36(codigo, horarioSemanal);
+      const topeReal = empleadoEs36 ? 36 : tope;
+      if (horas > topeReal) {
         const emp = empleados.find(e => e.codigo === codigo);
         if (emp && emp.esConfianza) return; // los cargos de confianza y manejo no tienen jornada máxima (Art. 162 CST)
-        const horasExtraSemana = Math.round((horas - tope) * 100) / 100;
+        const horasExtraSemana = Math.round((horas - topeReal) * 100) / 100;
         alertas42.push({
           codigo: codigo, nombre: emp ? emp.nombre : codigo,
-          semanaKey: semanaKey, horas: horas, tope: tope, horasExtra: horasExtraSemana
+          semanaKey: semanaKey, horas: horas, tope: topeReal, horasExtra: horasExtraSemana
         });
-        if (horasExtraSemana > LIMITE_EXTRA_SEMANAL_HORAS) {
+        // Para 6x6, cualquier exceso semanal es una violación del esquema
+        // (no está permitido que compense con horas extra), por eso el
+        // límite se marca directamente en 0 en vez de los 12h de la jornada normal.
+        const limiteSemanal36 = 0;
+        if (empleadoEs36 ? horasExtraSemana > limiteSemanal36 : horasExtraSemana > LIMITE_EXTRA_SEMANAL_HORAS) {
           alertasLegales.push({
-            tipo: "SEMANAL", codigo: codigo, nombre: emp ? emp.nombre : codigo,
-            semanaKey: semanaKey, horasExtra: horasExtraSemana, limite: LIMITE_EXTRA_SEMANAL_HORAS
+            tipo: empleadoEs36 ? "VIOLACION_6X6" : "SEMANAL", codigo: codigo, nombre: emp ? emp.nombre : codigo,
+            semanaKey: semanaKey, horasExtra: horasExtraSemana, limite: empleadoEs36 ? limiteSemanal36 : LIMITE_EXTRA_SEMANAL_HORAS
           });
         }
       }
@@ -1224,6 +1526,7 @@ function construirEventosPorDia(mesTexto, fechaInicio, fechaFin) {
     const minutos = horaStrAMinutos(filas[i][2]);
     const observaciones = String(filas[i][9] || "");
     const esAjuste = observaciones.indexOf("AJUSTE_MANUAL") !== -1;
+    const esCierreAutomatico = observaciones.indexOf("CIERRE_AUTOMATICO") !== -1;
 
     if (!eventos[codigo]) eventos[codigo] = {};
     if (!eventos[codigo][fecha]) eventos[codigo][fecha] = {};
@@ -1233,6 +1536,7 @@ function construirEventosPorDia(mesTexto, fechaInicio, fechaFin) {
     const yaEsAjuste = vieneDeAjuste[codigo][fecha][tipo] === true;
     if (yaEsAjuste && !esAjuste) continue; // un ajuste vigente no se deja pisar por una marca normal
 
+    if (esCierreAutomatico) eventos[codigo][fecha]._cierreAutomatico = true;
     if (esAjuste) {
       eventos[codigo][fecha][tipo] = minutos;
       vieneDeAjuste[codigo][fecha][tipo] = true;
@@ -1348,7 +1652,7 @@ function obtenerRangoFechasPeriodo(mesTexto, fechaInicio, fechaFin) {
 // Los días con una Novedad registrada (incapacidad, permiso,
 // vacaciones) NO se descuentan.
 // ---------------------------------------------------------
-function calcularHorasNoTrabajadasPeriodo(codigo, rango, horarioSemanal, eventosCodigo, novedadesCodigo) {
+function calcularHorasNoTrabajadasPeriodo(codigo, rango, horarioSemanal, eventosCodigo, novedadesCodigo, excepcionesCodigo) {
   let horasFaltantes = 0;
   let diasAusencia = 0;
   let diasIncompletos = 0;
@@ -1364,10 +1668,11 @@ function calcularHorasNoTrabajadasPeriodo(codigo, rango, horarioSemanal, eventos
     const fechaStr = Utilities.formatDate(d, zona, "yyyy-MM-dd");
     const diaNombre = DIAS_SEMANA_LUN_A_DOM[diaDeSemanaLunesA0(fechaStr)];
 
-    const excepcion = obtenerExcepcionHorario(codigo, fechaStr);
+    const excepcion = excepcionesCodigo && excepcionesCodigo[fechaStr];
     const turnoNormal = (horarioSemanal[codigo] || {})[diaNombre] || "LIBRE";
-    const debiaTrabajar = !!excepcion || turnoNormal === "APERTURA" || turnoNormal === "MEDIO" || turnoNormal === "CIERRE";
+    const debiaTrabajar = !!excepcion || esTurnoValido(turnoNormal);
     if (!debiaTrabajar) continue;
+    const horasEsperadasHoy = excepcion ? HORAS_PAGAS_POR_TURNO : horasPorTurno(turnoNormal);
 
     const novedadDelDia = novedadesCodigo && novedadesCodigo[fechaStr];
     if (novedadDelDia && novedadDelDia.estado !== "SIN_SOPORTE_DESCONTAR") {
@@ -1393,7 +1698,7 @@ function calcularHorasNoTrabajadasPeriodo(codigo, rango, horarioSemanal, eventos
     }
     if (horasTrabajadas > 0) diasTrabajados++;
 
-    const deficit = Math.max(0, HORAS_PAGAS_POR_TURNO - horasTrabajadas);
+    const deficit = Math.max(0, horasEsperadasHoy - horasTrabajadas);
     if (deficit > 0) {
       horasFaltantes += deficit;
       if (horasTrabajadas === 0) {
@@ -1407,7 +1712,9 @@ function calcularHorasNoTrabajadasPeriodo(codigo, rango, horarioSemanal, eventos
 
   // Art. 173 CST: quien no trabajó todos los días hábiles de la semana (sin
   // justificación) pierde el derecho al pago del día de descanso remunerado
-  // de esa semana — se descuenta un día adicional (7h) por cada semana afectada.
+  // de esa semana — se descuenta un día adicional por cada semana afectada
+  // (7h para jornada de 42h; para 6x6 este esquema ya incluye el descanso
+  // dentro del sueldo fijo semanal, así que solo aplica a la jornada de 42h).
   const semanasSinDescanso = Object.keys(semanasConAusencia).length;
   const horasDescansoPerdido = semanasSinDescanso * HORAS_PAGAS_POR_TURNO;
   horasFaltantes += horasDescansoPerdido;
@@ -1432,6 +1739,7 @@ function calcularResumenNomina(mesTexto, fechaInicio, fechaFin, divisorHorasPeri
 
   const horarioSemanal = obtenerHorarioSemanalCompleto();
   const novedadesRango = obtenerNovedadesRango(rango.inicio, rango.fin);
+  const excepcionesRango = obtenerExcepcionesRango(rango.inicio, rango.fin);
 
   const bucketsVacios = () => ({
     diurnoOrd: 0, nocturnoOrd: 0, diurnoExtra: 0, nocturnoExtra: 0,
@@ -1440,19 +1748,50 @@ function calcularResumenNomina(mesTexto, fechaInicio, fechaFin, divisorHorasPeri
 
   const resultado = {};
   const diasTrabajadosPorCodigo = {}; // { diasOrdinarios, diasDomFest } — para pagar a los turneros por día
+  const horas36PorCodigo = {}; // { horasSinRecargo, diasConViolacion } — para empleados en jornada 6x6
   empleados.forEach(emp => {
     resultado[emp.codigo] = bucketsVacios();
     diasTrabajadosPorCodigo[emp.codigo] = { diasOrdinarios: 0, diasDomFest: 0 };
+    horas36PorCodigo[emp.codigo] = { horasSinRecargo: 0, diasConViolacion: [] };
   });
 
   Object.keys(eventos).forEach(codigo => {
     if (!resultado[codigo]) resultado[codigo] = bucketsVacios();
     if (!diasTrabajadosPorCodigo[codigo]) diasTrabajadosPorCodigo[codigo] = { diasOrdinarios: 0, diasDomFest: 0 };
+    if (!horas36PorCodigo[codigo]) horas36PorCodigo[codigo] = { horasSinRecargo: 0, diasConViolacion: [] };
+
     Object.keys(eventos[codigo]).forEach(fecha => {
       const ev = eventos[codigo][fecha];
       if (ev.ENTRADA === undefined || ev.SALIDA === undefined) return; // registro incompleto, se omite
 
+      // ¿Qué turno tenía programado ESE día? De ahí se sabe si es jornada de
+      // 42h (con recargo normal) o de 36h/6x6 (sin recargo nocturno ni
+      // dominical/festivo, Art. 161 CST, pero con tope estricto de 6h/día).
+      const diaNombreEv = DIAS_SEMANA_LUN_A_DOM[diaDeSemanaLunesA0(fecha)];
+      const excepcionDia = excepcionesRango[codigo] && excepcionesRango[codigo][fecha];
+      const turnoDelDia = excepcionDia ? null : ((horarioSemanal[codigo] || {})[diaNombreEv] || "LIBRE");
+      const esJornada36 = turnoDelDia && jornadaDeTurno(turnoDelDia) === "36";
+
       const intervalos = construirIntervalosTrabajo(ev.ENTRADA, ev.SALIDA, ev.SALIDA_ALMUERZO, ev.REGRESO_ALMUERZO);
+
+      if (esJornada36) {
+        // Jornada 6x6: se paga TODO a tarifa plana, sin ningún recargo —
+        // ni nocturno, ni dominical/festivo (esa es la condición legal del
+        // esquema). Si algún día supera las horas del turno (6h), es una
+        // violación de las condiciones del esquema, no "horas extra a pagar".
+        let minutosDia = 0;
+        intervalos.forEach(([ini, fin]) => { minutosDia += (fin - ini); });
+        const horasDia = minutosDia / 60;
+        horas36PorCodigo[codigo].horasSinRecargo += horasDia;
+        const topeTurno36 = horasPorTurno(turnoDelDia);
+        if (horasDia > topeTurno36 + 0.01) {
+          horas36PorCodigo[codigo].diasConViolacion.push({ fecha: fecha, horas: Math.round(horasDia*100)/100, tope: topeTurno36 });
+        }
+        const esFestivoDia = esFestivoODomingo(fecha);
+        if (esFestivoDia) diasTrabajadosPorCodigo[codigo].diasDomFest++; else diasTrabajadosPorCodigo[codigo].diasOrdinarios++;
+        return; // no pasa por el desglose normal de recargos
+      }
+
       const desglose = desglosarMinutosDelDia(intervalos);
       const esFestivo = esFestivoODomingo(fecha);
 
@@ -1479,11 +1818,13 @@ function calcularResumenNomina(mesTexto, fechaInicio, fechaFin, divisorHorasPeri
     Object.keys(h).forEach(k => h[k] = Math.round(h[k] * 100) / 100);
 
     const infoFaltante = calcularHorasNoTrabajadasPeriodo(
-      emp.codigo, rango, horarioSemanal, eventos[emp.codigo] || {}, novedadesRango[emp.codigo] || {}
+      emp.codigo, rango, horarioSemanal, eventos[emp.codigo] || {}, novedadesRango[emp.codigo] || {}, excepcionesRango[emp.codigo] || {}
     );
 
     let valorHora = null;
     let valorTotal = null;
+    const horas36Info = horas36PorCodigo[emp.codigo] || { horasSinRecargo: 0, diasConViolacion: [] };
+    const horas36Redondeadas = Math.round(horas36Info.horasSinRecargo * 100) / 100;
     if (emp.salarioMensual && emp.salarioMensual > 0) {
       valorHora = emp.salarioMensual / DIVISOR_HORAS_MES; // el valor/hora nunca cambia, sea mes o quincena
       valorTotal = Math.round(
@@ -1494,7 +1835,8 @@ function calcularResumenNomina(mesTexto, fechaInicio, fechaFin, divisorHorasPeri
         h.festDiurnoOrd * valorHora * (1 + RECARGO_DOMINICAL_FESTIVO) +
         h.festNocturnoOrd * valorHora * (1 + RECARGO_DOMINICAL_FESTIVO + RECARGO_NOCTURNO) +
         h.festDiurnoExtra * valorHora * (1 + RECARGO_DOMINICAL_FESTIVO + RECARGO_EXTRA_DIURNA) +
-        h.festNocturnoExtra * valorHora * (1 + RECARGO_DOMINICAL_FESTIVO + RECARGO_EXTRA_NOCTURNA)
+        h.festNocturnoExtra * valorHora * (1 + RECARGO_DOMINICAL_FESTIVO + RECARGO_EXTRA_NOCTURNA) +
+        horas36Redondeadas * valorHora * 1 // jornada 6x6: siempre tarifa plana, sin ningún recargo
       );
     }
 
@@ -1521,6 +1863,8 @@ function calcularResumenNomina(mesTexto, fechaInicio, fechaFin, divisorHorasPeri
       auxilioTransporte: auxTransporteFinal,
       diasOrdinariosTrabajados: diasInfo.diasOrdinarios, diasDomFestTrabajados: diasInfo.diasDomFest,
       valorDiaOrdinario: valorDiaOrdinario, valorDiaDomFest: valorDiaDomFest, valorPorDiasTrabajados: valorPorDias,
+      horas36: horas36Redondeadas, violaciones36: horas36Info.diasConViolacion,
+      esJornada36: empleadoTieneJornada36(emp.codigo, horarioSemanal),
       cedula: emp.cedula, direccion: emp.direccion, email: emp.email, telefono: emp.telefono,
       eps: emp.eps, afp: emp.afp, arl: emp.arl, banco: emp.banco, cuenta: emp.cuenta,
       horasNoTrabajadas: infoFaltante.horasFaltantes,
